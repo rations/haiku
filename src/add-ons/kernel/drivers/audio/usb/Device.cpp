@@ -37,10 +37,10 @@ Device::Device(usb_device device)
 	fProductID = deviceDescriptor->product_id;
 	fUSBVersion = deviceDescriptor->usb_version;
 
-#if 1
-	if (fUSBVersion >= 0x200)
-		return;
-#endif
+	// UAC1 (full-speed) and UAC2 (high-speed) are both handled: the class-
+	// specific descriptor layout is selected per entity by the AudioControl
+	// header's bcdADC, and a device whose descriptors do not parse into a
+	// usable stream is rejected cleanly below via InitCheck (fail closed).
 
 	fBuffersReadySem = create_sem(0, DRIVER_NAME "_buffers_ready");
 	if (fBuffersReadySem < B_OK) {

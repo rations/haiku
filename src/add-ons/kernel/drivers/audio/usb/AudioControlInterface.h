@@ -88,6 +88,7 @@ public:
 
 			uint16			TerminalType() { return fTerminalType; }
 			bool			IsUSBIO();
+			uint8			ClockSourceId() { return fClockSourceId; }
 	virtual	const char*		Name();
 	static	const char*		_GetTerminalDescription(uint16 TerminalType);
 
@@ -224,7 +225,13 @@ public:
 								usb_audiocontrol_header_descriptor* Header);
 	virtual					~ClockSource();
 
+	virtual	const char*		Name() { return "Clock Source"; }
+			bool			SamplingFrequencyReadable();
+			bool			SamplingFrequencyWritable();
+
 protected:
+			uint8			fClockType;			// bmAttributes
+			uint8			fControlsBitmap;	// bmControls
 };
 
 
@@ -234,7 +241,11 @@ public:
 								usb_audiocontrol_header_descriptor* Header);
 	virtual					~ClockSelector();
 
-protected:
+	virtual	const char*		Name() { return "Clock Selector"; }
+
+//	protected:
+			Vector<uint8>	fInputPins;
+			uint8			fControlsBitmap;
 };
 
 
@@ -244,7 +255,10 @@ public:
 								usb_audiocontrol_header_descriptor* Header);
 	virtual					~ClockMultiplier();
 
+	virtual	const char*		Name() { return "Clock Multiplier"; }
+
 protected:
+			uint8			fControlsBitmap;
 };
 
 
@@ -276,6 +290,15 @@ public:
 			_AudioControl*	Find(uint8 id);
 			_AudioControl*	FindOutputTerminal(uint8 id);
 			uint16			SpecReleaseNumber() { return fADCSpecification; }
+
+			// R2: Clock Source handling. The stream identifies its clock via
+			// its terminal; sampling frequency is get/set through Clock Source
+			// class requests on the AudioControl interface (not on the endpoint
+			// as in R1).
+			uint8			ClockSourceIdForTerminal(uint8 terminalId);
+			status_t		GetSamplingRates(uint8 clockId,
+								Vector<uint32>& rates);
+			status_t		SetSamplingRate(uint8 clockId, uint32 rate);
 
 			AudioControlsMap&
 							Controls() { return fAudioControls; }

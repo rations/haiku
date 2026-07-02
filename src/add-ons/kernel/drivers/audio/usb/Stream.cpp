@@ -68,37 +68,64 @@ Stream::_ChooseAlternate()
 			continue;
 		}
 
-		switch (fAlternates[i]->Interface()->fFormatTag) {
-			case USB_AUDIO_FORMAT_PCM:
-			case USB_AUDIO_FORMAT_PCM8:
-			case USB_AUDIO_FORMAT_IEEE_FLOAT:
-		//	case USB_AUDIO_FORMAT_ALAW:
-		//	case USB_AUDIO_FORMAT_MULAW:
-				break;
-			default:
-				TRACE(ERR, "Ignore alternate %d - format %#04x is not "
-					"supported.\n", i, fAlternates[i]->Interface()->fFormatTag);
-			continue;
-		}
-
+		ASInterfaceDescriptor* asInterface = fAlternates[i]->Interface();
 		TypeIFormatDescriptor* format
 			= static_cast<TypeIFormatDescriptor*>(fAlternates[i]->Format());
 
-		if (format->fNumChannels > 2) {
+		if (asInterface->fIsR2) {
+			// R2: supported formats are a bitmap; accept PCM / PCM8 / FLOAT.
+			uint32 supported = USB_AUDIO_R2_FORMAT_PCM
+				| USB_AUDIO_R2_FORMAT_PCM8 | USB_AUDIO_R2_FORMAT_IEEE_FLOAT;
+			if ((asInterface->fBmFormats & supported) == 0) {
+				TRACE(ERR, "Ignore alternate %d - formats %#08x are not "
+					"supported.\n", i, asInterface->fBmFormats);
+				continue;
+			}
+
+			if ((asInterface->fBmFormats & USB_AUDIO_R2_FORMAT_PCM) != 0) {
+				switch (format->fBitResolution) {
+					default:
+					TRACE(ERR, "Ignore alternate %d - bit resolution %d "
+						"is not supported.\n", i, format->fBitResolution);
+						continue;
+					case 8: case 16: case 18: case 20: case 24: case 32:
+						break;
+				}
+			}
+		} else {
+			switch (asInterface->fFormatTag) {
+				case USB_AUDIO_FORMAT_PCM:
+				case USB_AUDIO_FORMAT_PCM8:
+				case USB_AUDIO_FORMAT_IEEE_FLOAT:
+			//	case USB_AUDIO_FORMAT_ALAW:
+			//	case USB_AUDIO_FORMAT_MULAW:
+					break;
+				default:
+					TRACE(ERR, "Ignore alternate %d - format %#04x is not "
+						"supported.\n", i, asInterface->fFormatTag);
+				continue;
+			}
+
+			if (asInterface->fFormatTag == USB_AUDIO_FORMAT_PCM) {
+				switch(format->fBitResolution) {
+					default:
+					TRACE(ERR, "Ignore alternate %d - bit resolution %d "
+						"is not supported.\n", i, format->fBitResolution);
+						continue;
+					case 8: case 16: case 18: case 20: case 24: case 32:
+						break;
+				}
+			}
+		}
+
+		// R1 was only ever exercised with mono/stereo; R2 targets such as the
+		// 4-in/4-out UMC204HD need more, bounded by the hmulti channel maximum.
+		uint8 maxChannels = asInterface->fIsR2
+			? AudioControlInterface::kChannels : 2;
+		if (format->fNumChannels > maxChannels) {
 			TRACE(ERR, "Ignore alternate %d - channel count %d "
 				"is not supported.\n", i, format->fNumChannels);
 			continue;
-		}
-
-		if (fAlternates[i]->Interface()->fFormatTag == USB_AUDIO_FORMAT_PCM) {
-			switch(format->fBitResolution) {
-				default:
-				TRACE(ERR, "Ignore alternate %d - bit resolution %d "
-					"is not supported.\n", i, format->fBitResolution);
-					continue;
-				case 8: case 16: case 18: case 20: case 24: case 32:
-					break;
-			}
 		}
 
 		uint16 chxRes = format->fNumChannels * 100 + format->fBitResolution;
@@ -134,7 +161,55 @@ status_t
 Stream::Init()
 {
 	fStatus = _ChooseAlternate();
+	if (fStatus != B_OK)
+		return fStatus;
+
+	// R2 devices do not carry the sample-rate list in the format descriptor;
+	// query it from the Clock Source that feeds this stream's terminal.
+	if (fControlInterface->SpecReleaseNumber() >= 0x200)
+		fStatus = _SetupUAC2Rates();
+
 	return fStatus;
+}
+
+
+status_t
+Stream::_SetupUAC2Rates()
+{
+	AudioStreamAlternate* alternate = fAlternates[fActiveAlternate];
+	TypeIFormatDescriptor* format
+		= static_cast<TypeIFormatDescriptor*>(alternate->Format());
+	if (format == NULL)
+		return B_NO_INIT;
+
+	uint8 clockId = fControlInterface->ClockSourceIdForTerminal(TerminalLink());
+	if (clockId == 0) {
+		TRACE(ERR, "No clock source for terminal %d.\n", TerminalLink());
+		return B_ERROR;
+	}
+
+	Vector<uint32> rates;
+	status_t status = fControlInterface->GetSamplingRates(clockId, rates);
+	if (status != B_OK)
+		return status;
+
+	if (rates.Count() <= 0) {
+		TRACE(ERR, "Clock %d reported no sampling rates.\n", clockId);
+		return B_ERROR;
+	}
+
+	// Cache the discrete rates on the active alternate so the existing rate
+	// reporting / selection paths (which read the format descriptor) work
+	// unchanged. A non-zero frequency type marks a discrete list.
+	format->fSampleFrequencies.MakeEmpty();
+	for (int i = 0; i < rates.Count(); i++)
+		format->fSampleFrequencies.PushBack(rates[i]);
+	format->fSampleFrequencyType = rates.Count();
+
+	// Pick a sensible default (highest available) until the media kit sets one.
+	alternate->SetSamplingRate(0);
+
+	return B_OK;
 }
 
 
@@ -417,7 +492,12 @@ Stream::SetGlobalFormat(multi_format_info* Format)
 {
 	_multi_format* format = fIsInput ? &Format->input : &Format->output;
 	AudioStreamAlternate* alternate = fAlternates[fActiveAlternate];
-	if (format->rate == alternate->GetSamplingRateId(0)
+	// Skip reconfiguration only when nothing changed AND the buffers have
+	// already been allocated. On the first call the requested format usually
+	// already matches the alternate's default, but the sample buffers still
+	// need to be set up (and the device's sampling rate programmed) before any
+	// streaming can happen, so fall through while no area exists yet.
+	if (fArea >= 0 && format->rate == alternate->GetSamplingRateId(0)
 			&& format->format == alternate->GetFormatId()) {
 		TRACE(INF, "No changes required\n");
 		return B_OK;
@@ -440,8 +520,26 @@ Stream::SetGlobalFormat(multi_format_info* Format)
 	if (status != B_OK)
 		return status;
 
-	// set endpoint speed
+	// set the sampling rate
 	uint32 samplingRate = fAlternates[fActiveAlternate]->GetSamplingRate();
+
+	if (fControlInterface->SpecReleaseNumber() >= 0x200) {
+		// R2: the rate is set with a Clock Source class request on the
+		// AudioControl interface, not an endpoint request as in R1.
+		uint8 clockId
+			= fControlInterface->ClockSourceIdForTerminal(TerminalLink());
+		if (clockId == 0) {
+			TRACE(ERR, "No clock source for terminal %d.\n", TerminalLink());
+			return B_ERROR;
+		}
+
+		status = fControlInterface->SetSamplingRate(clockId, samplingRate);
+		TRACE(ERR, "set_speed %d for clock %d: %s\n",
+			samplingRate, clockId, strerror(status));
+		return status;
+	}
+
+	// R1: set endpoint speed
 	size_t actualLength = 0;
 	usb_audio_sampling_freq freq = _ASFormatDescriptor::GetSamFreq(samplingRate);
 	uint8 address = fAlternates[fActiveAlternate]->Endpoint()->fEndpointAddress;

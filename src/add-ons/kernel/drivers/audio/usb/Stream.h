@@ -64,6 +64,7 @@ protected:
 
 private:
 			status_t		_ChooseAlternate();
+			status_t		_SetupUAC2Rates();
 			status_t		_SetupBuffers();
 			status_t		_QueueNextTransfer(size_t buffer, bool start);
 	static	void			_TransferCallback(void* cookie, status_t status,
