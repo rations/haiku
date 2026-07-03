@@ -23,6 +23,8 @@ Device::Device(usb_device device)
 	fDevice(device),
 	fNonBlocking(false),
 	fAudioControl(this),
+	fFeedbackFrames(0),
+	fImplicitFeedbackSource(false),
 	fBuffersReadySem(-1)
 {
 	const usb_device_descriptor* deviceDescriptor
@@ -67,6 +69,20 @@ Device::~Device()
 
 	if (fBuffersReadySem > B_OK)
 		delete_sem(fBuffersReadySem);
+}
+
+
+void
+Device::PublishFeedback(int32 framesPerPacket)
+{
+	atomic_set(&fFeedbackFrames, framesPerPacket);
+}
+
+
+int32
+Device::Feedback()
+{
+	return atomic_get(&fFeedbackFrames);
 }
 
 

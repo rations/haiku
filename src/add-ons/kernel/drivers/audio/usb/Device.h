@@ -42,6 +42,20 @@ public:
 			AudioControlInterface&
 							AudioControl() { return fAudioControl; }
 
+			// Implicit feedback: a capture stream whose endpoint carries the
+			// "implicit feedback data" usage type is the sampling-clock
+			// reference for an asynchronous playback stream on the same device
+			// (both run off one crystal). The capture stream publishes its
+			// measured rate here and the playback stream reads it to size its
+			// outgoing packets. The value is audio frames per (micro)frame in
+			// 16.16 fixed point, or 0 until the first buffer has been measured.
+			void			PublishFeedback(int32 framesPerPacket);
+			int32			Feedback();
+			bool			HasImplicitFeedbackSource()
+								{ return fImplicitFeedbackSource; }
+			void			SetImplicitFeedbackSource()
+								{ fImplicitFeedbackSource = true; }
+
 private:
 			status_t		_SetupEndpoints();
 
@@ -66,6 +80,9 @@ private:
 
 			AudioControlInterface	fAudioControl;
 			Vector<Stream*>	fStreams;
+
+			int32			fFeedbackFrames;
+			bool			fImplicitFeedbackSource;
 
 // protected:
 			status_t		_MultiGetDescription(multi_description* Description);

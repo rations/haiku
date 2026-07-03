@@ -48,6 +48,7 @@ protected:
 			usb_pipe		fStreamEndpoint;
 
 			bool			fIsRunning;
+			uint16			fMaxPacketSize;
 			area_id			fArea, fKernelArea;
 			size_t			fAreaSize;
 			usb_iso_packet_descriptor* fDescriptors;
@@ -62,6 +63,46 @@ protected:
 			int32			fProcessedBuffers;
 			int32			fInsideNotify;
 
+			// Asynchronous feedback for a UAC2 async playback endpoint. The
+			// device reports its true sampling rate so we can resize the
+			// outgoing packets to match and keep its FIFO from under/overrunning.
+			// Two sources are supported: an explicit isochronous feedback IN
+			// endpoint (16.16 samples per microframe), or -- when the device
+			// tags its capture endpoint with the "implicit feedback" usage type
+			// -- the capture stream's own measured delivery rate. Playback and
+			// capture share one clock, so the latter is exact and is preferred
+			// (many devices, e.g. the Behringer UMC2xxHD, advertise an explicit
+			// feedback endpoint their firmware never actually services).
+			static const uint32 kFeedbackPackets = 8;
+
+			bool			fDataEndpointIsAsync;
+			bool			fIsFeedbackSource;
+			bool			fUseImplicitFeedback;
+			bool			fUseExplicitFeedback;
+
+			// Running totals used by a capture feedback source to derive the
+			// device's true rate. Per-buffer frame counts are integers and so
+			// quantize the rate too coarsely to see crystal drift; accumulating
+			// across buffers recovers the fractional part. Halved periodically
+			// so the average stays responsive and the counters stay bounded.
+			uint64			fCaptureFramesTotal;
+			uint64			fCapturePacketsTotal;
+
+			usb_pipe		fFeedbackEndpoint;
+			area_id			fFeedbackArea;
+			uint8*			fFeedbackBuffer;
+			usb_iso_packet_descriptor fFeedbackDescriptors[kFeedbackPackets];
+			uint16			fFeedbackPacketSize;
+			uint32			fFeedbackFrame;
+			size_t			fPacketsPerBuffer;
+			uint32			fNominalFreq;
+			uint32			fMaxFreq;
+			uint32			fMaxFrameSize;
+			uint8			fDataInterval;
+			int32			fCurrentFreq;
+			uint32			fFeedbackPhase;
+			int32			fFreqShift;
+
 private:
 			status_t		_ChooseAlternate();
 			status_t		_SetupUAC2Rates();
@@ -69,6 +110,15 @@ private:
 			status_t		_QueueNextTransfer(size_t buffer, bool start);
 	static	void			_TransferCallback(void* cookie, status_t status,
 								void* data, size_t actualLength);
+			void			_InitFeedbackParams(uint32 rate);
+			size_t			_FillPlaybackPackets(
+								usb_iso_packet_descriptor* descriptors,
+								size_t frames, uint32 stride);
+			status_t		_QueueFeedback();
+	static	void			_FeedbackCallback(void* cookie, status_t status,
+								void* data, size_t actualLength);
+			void			_ProcessFeedback(const uint8* data, size_t length);
+			void			_PublishImplicitFeedback(size_t actualLength);
 			void			_DumpDescriptors();
 };
 
