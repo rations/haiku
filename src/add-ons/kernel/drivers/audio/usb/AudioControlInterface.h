@@ -299,6 +299,8 @@ public:
 			status_t		GetSamplingRates(uint8 clockId,
 								Vector<uint32>& rates);
 			status_t		SetSamplingRate(uint8 clockId, uint32 rate);
+			uint8			LastClockId() { return fLastClockId; }
+			uint32			LastClockRate() { return fLastClockRate; }
 
 			AudioControlsMap&
 							Controls() { return fAudioControls; }
@@ -363,6 +365,10 @@ protected:
 			Vector<uint8>	fStreams;
 			uint8			fFunctionCategory;
 			uint8			fControlsBitmap;
+			// R2: last rate programmed to a Clock Source, for restoring the
+			// (stream-shared) clock after a device reattach.
+			uint8			fLastClockId;
+			uint32			fLastClockRate;
 			Device*			fDevice;
 
 			// map to store all controls and lookup by control ID

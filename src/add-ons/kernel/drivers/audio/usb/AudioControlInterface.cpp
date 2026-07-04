@@ -1000,6 +1000,8 @@ AudioControlInterface::AudioControlInterface(Device* device)
 	fADCSpecification(0),
 	fFunctionCategory(0),
 	fControlsBitmap(0),
+	fLastClockId(0),
+	fLastClockRate(0),
 	fDevice(device)
 {
 }
@@ -1318,6 +1320,13 @@ AudioControlInterface::SetSamplingRate(uint8 clockId, uint32 rate)
 	status_t status = gUSBModule->send_request(fDevice->USBDevice(),
 		USB_REQTYPE_INTERFACE_OUT | USB_REQTYPE_CLASS, USB_AUDIO_R2_CUR,
 		value, index, sizeof(data), &data, &actualLength);
+
+	if (status == B_OK) {
+		// Remembered so a device reattach can restore the clock exactly as
+		// it was programmed (see Device::CompareAndReattach()).
+		fLastClockId = clockId;
+		fLastClockRate = rate;
+	}
 
 	TRACE(INF, "Set clock %d sampling rate %d: %s (%d bytes)\n",
 		clockId, rate, strerror(status), actualLength);

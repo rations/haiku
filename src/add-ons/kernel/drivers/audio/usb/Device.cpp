@@ -516,6 +516,20 @@ Device::CompareAndReattach(usb_device device)
 		return result;
 	}
 
+	// An R2 device's streams share their clock; restore the rate that was
+	// last programmed before the removal, rather than letting each stream
+	// re-apply its own selection (whichever came last would win and could
+	// change the clock underneath the other stream).
+	if (fAudioControl.SpecReleaseNumber() >= 0x200
+			&& fAudioControl.LastClockId() != 0) {
+		result = fAudioControl.SetSamplingRate(fAudioControl.LastClockId(),
+			fAudioControl.LastClockRate());
+		if (result != B_OK) {
+			fRemoved = true;
+			return result;
+		}
+	}
+
 	// The replugged device starts with an empty FIFO; drop any feedback
 	// packets left from before the unplug so they cannot pace the restarted
 	// playback stream.

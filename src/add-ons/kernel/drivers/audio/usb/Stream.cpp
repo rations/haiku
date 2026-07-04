@@ -593,9 +593,15 @@ Stream::OnReattach(usb_device device, const usb_configuration_info* config)
 	if (status != B_OK)
 		return status;
 
-	// The replugged device was power cycled and lost its sampling rate;
-	// program the selected rate again so streaming can just resume.
-	return _SetDeviceSamplingRate();
+	// The replugged device was power cycled and lost its sampling rate. R1
+	// rates are per endpoint, so each stream restores its own here. An R2
+	// clock is shared between the streams -- and a stream's selected rate
+	// may lag what the clock was last set to -- so it is restored once by
+	// Device::CompareAndReattach() instead.
+	if (fControlInterface->SpecReleaseNumber() < 0x200)
+		return _SetDeviceSamplingRate();
+
+	return B_OK;
 }
 
 
