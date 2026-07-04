@@ -829,7 +829,7 @@ XHCI::Start()
 
 	fRootHub->RegisterNode(Node());
 
-	TRACE_ALWAYS("successfully started the controller\n");
+	TRACE_ALWAYS("successfully started the controller [OVERRIDE-BUILD]\n");
 
 #ifdef TRACE_USB
 	TRACE("No-Op test...\n");
@@ -968,6 +968,21 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 	status_t status = transfer->InitKernelAccess();
 	if (status != B_OK)
 		return status;
+
+	// An isochronous OUT transfer whose packets are not all the same length
+	// cannot be expressed by the uniform-packet path below (it forces a single
+	// packet size on the whole transfer). Hand it to a dedicated path. Every
+	// existing caller uses uniform packet lengths, so this leaves them, and all
+	// non-isochronous and all IN transfers, on the unchanged path.
+	if (isochronousData != NULL && !directionIn && !transfer->IsPhysical()
+			&& isochronousData->packet_count > 1) {
+		const usb_iso_packet_descriptor* descriptors
+			= isochronousData->packet_descriptors;
+		for (uint32 i = 1; i < isochronousData->packet_count; i++) {
+			if (descriptors[i].request_length != descriptors[0].request_length)
+				return _SubmitIsochronousVariableOut(transfer, endpoint);
+		}
+	}
 
 	// TRBs within a TD must be "grouped" into TD Fragments, which mostly means
 	// that a max_burst_payload boundary cannot be crossed within a TRB, but
@@ -1112,6 +1127,144 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 	}
 
 	td->transfer = transfer;
+	status = _LinkDescriptorForPipe(td, endpoint);
+	if (status != B_OK) {
+		FreeDescriptor(td);
+		return status;
+	}
+
+	return B_OK;
+}
+
+
+status_t
+XHCI::_SubmitIsochronousVariableOut(Transfer *transfer, xhci_endpoint *endpoint)
+{
+	// An isochronous OUT transfer whose packets are not all the same length.
+	// The transfer ring posts one single-TRB Isoch TD per packet, each Isoch TRB
+	// carrying its own Transfer Length -- exactly how the spec says to hit a
+	// fractional data rate (XHCI 1.2 § 3.2.11 "Fractional Isoch Transfers",
+	// § 4.11.2). This is what USB audio asynchronous feedback needs (e.g. 24
+	// audio frames in one microframe, 25 in the next). The general path in
+	// SubmitNormalRequest() collapses a transfer to a single uniform packet
+	// size, so this case is handled here.
+	Pipe *pipe = transfer->TransferPipe();
+	usb_isochronous_data *isochronousData = transfer->IsochronousData();
+	const size_t maxPacketSize = pipe->MaxPacketSize();
+	const uint32 packetCount = isochronousData->packet_count;
+
+	// The packet descriptors may originate from userspace (usb_raw), so treat
+	// every field as untrusted and validate before it is used to size an
+	// allocation or index the buffer; fail closed on anything inconsistent.
+	// 512 packets is far above any real use (audio needs <= ~170) and bounds the
+	// TRB allocation.
+	if (packetCount == 0 || packetCount > 512)
+		return B_BAD_VALUE;
+
+	size_t totalLength = 0;
+	for (uint32 i = 0; i < packetCount; i++) {
+		uint32 length = isochronousData->packet_descriptors[i].request_length;
+		if (length == 0 || length > maxPacketSize)
+			return B_BAD_VALUE;
+		totalLength += length;
+	}
+
+	// The packets must exactly cover the transfer's data. No existing caller
+	// produces variable-length OUT packets, so this never rejects a currently
+	// working transfer.
+	if (totalLength != transfer->FragmentLength()
+			|| totalLength != transfer->DataLength()) {
+		return B_BAD_VALUE;
+	}
+
+	// One DMA buffer per packet (each at most wMaxPacketSize), mirroring the
+	// uniform isochronous path in SubmitNormalRequest(): every Isoch TD points
+	// at its own buffer rather than a shared one.
+	xhci_td *td = CreateDescriptor(packetCount, packetCount, maxPacketSize);
+	if (td == NULL)
+		return B_NO_MEMORY;
+
+	// Copy each packet's data to the start of its own buffer. The source data is
+	// contiguous across the packets, so walk the transfer's I/O vectors handing
+	// each packet exactly its request_length bytes. (WriteDescriptor() cannot be
+	// used here: it fills fixed buffer_size segments, which would misalign
+	// variable-length packets.)
+	status_t status = transfer->PrepareKernelAccess();
+	if (status != B_OK) {
+		FreeDescriptor(td);
+		return status;
+	}
+	generic_io_vec* vector = transfer->Vector();
+	const size_t vectorCount = transfer->VectorCount();
+	size_t vecIdx = 0, vecOffset = 0;
+	for (uint32 i = 0; i < packetCount; i++) {
+		size_t length = isochronousData->packet_descriptors[i].request_length;
+		size_t copied = 0;
+		while (copied < length && vecIdx < vectorCount) {
+			size_t toCopy = min_c(length - copied,
+				(size_t)vector[vecIdx].length - vecOffset);
+			status = generic_memcpy(
+				(generic_addr_t)td->buffers[i] + copied, false,
+				vector[vecIdx].base + vecOffset, false, toCopy);
+			if (status != B_OK) {
+				FreeDescriptor(td);
+				return status;
+			}
+			copied += toCopy;
+			vecOffset += toCopy;
+			if (vecOffset == (size_t)vector[vecIdx].length) {
+				vecIdx++;
+				vecOffset = 0;
+			}
+		}
+		if (copied != length) {
+			FreeDescriptor(td);
+			return B_BAD_VALUE;
+		}
+	}
+
+	// Build one single-TRB Isoch TD per packet, each pointing at its own buffer
+	// with its own length. Each is its own single-TRB TD, so its TD Size is 0
+	// (XHCI 1.2 § 4.11.2.4). Fields are written in host order; the endianness
+	// conversion happens in _LinkDescriptorForPipe().
+	for (uint32 i = 0; i < packetCount; i++) {
+		uint32 length = isochronousData->packet_descriptors[i].request_length;
+
+		td->trbs[i].address = td->buffer_addrs[i];
+		td->trbs[i].status = TRB_2_IRQ(0) | TRB_2_BYTES(length)
+			| TRB_2_TD_SIZE(0);
+		td->trbs[i].flags = TRB_3_TYPE(TRB_TYPE_ISOCH) | TRB_3_CYCLE_BIT;
+
+		if (i != (packetCount - 1)) {
+			// End the TD here (no Chain); generate a non-interrupting event on a
+			// short packet, as the general iso path does.
+			td->trbs[i].flags |= TRB_3_ISP_BIT | TRB_3_BEI_BIT;
+		} else {
+			// The last TRB keeps the Chain bit so the Link TRB appended by
+			// _LinkDescriptorForPipe() is formally part of this TD, which is
+			// required when using the ENT bit (XHCI 1.2 § 4.12.3).
+			td->trbs[i].flags |= TRB_3_CHAIN_BIT | TRB_3_ENT_BIT;
+		}
+	}
+
+	// Determine the (starting) frame: with ISO_ASAP we start the first TD as
+	// soon as possible and the rest are consumed one per interval, matching the
+	// general path (XHCI 1.2 § 4.14.2.1.4).
+	uint32 frame;
+	if ((isochronousData->flags & USB_ISO_ASAP) != 0
+			|| isochronousData->starting_frame_number == NULL) {
+		frame = (ReadRunReg32(XHCI_MFINDEX) + 1) >> 3;
+		td->trbs[0].flags |= TRB_3_ISO_SIA_BIT;
+	} else {
+		frame = *isochronousData->starting_frame_number;
+		td->trbs[0].flags |= TRB_3_FRID(frame);
+	}
+	if (isochronousData->starting_frame_number != NULL)
+		*isochronousData->starting_frame_number = frame;
+
+	td->trb_used = packetCount;
+	td->transfer = transfer;
+
 	status = _LinkDescriptorForPipe(td, endpoint);
 	if (status != B_OK) {
 		FreeDescriptor(td);
@@ -2819,7 +2972,8 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 		}
 		return;
 	}
-	TRACE_ERROR("TRB 0x%" B_PRIxPHYSADDR " was not found in the endpoint!\n", source);
+	TRACE_ERROR("TRB 0x%" B_PRIxPHYSADDR " was not found in the endpoint!\n",
+		source);
 }
 
 
