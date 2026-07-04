@@ -166,6 +166,9 @@ private:
 			size_t				ReadDescriptor(xhci_td *descriptor,
 									generic_io_vec *vector, size_t vectorCount, bool physical);
 
+			status_t			_SubmitIsochronousVariableOut(
+									Transfer *transfer, xhci_endpoint *endpoint);
+
 			status_t			_LinkDescriptorForPipe(xhci_td *descriptor,
 									xhci_endpoint *endpoint);
 			status_t			_UnlinkDescriptorForPipe(xhci_td *descriptor,

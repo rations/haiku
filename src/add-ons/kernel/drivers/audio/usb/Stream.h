@@ -51,6 +51,28 @@ protected:
 			uint16			fMaxPacketSize;
 			area_id			fArea, fKernelArea;
 			size_t			fAreaSize;
+
+			// Capture reception scratch. Isochronous IN packets are received at
+			// full wMaxPacketSize stride into this kernel-only buffer, so a
+			// device running slightly fast can burst above the nominal packet
+			// size without overrunning the media buffer; the completion callback
+			// repacks the delivered frames contiguously into the record buffer.
+			// This also lets the capture stream measure the device's true rate
+			// (implicit feedback). Output streams do not use it.
+			area_id			fRecordScratchArea;
+			uint8*			fRecordScratch;
+
+			// Staging for a feedback-paced playback stream. Each outgoing
+			// transfer is assembled here as the sub-packet remainder of the
+			// previous transfer followed by the media buffer, so packets can
+			// be cut purely by the feedback schedule instead of being rounded
+			// to the media buffer boundary (which would pin the stream to the
+			// nominal rate). The carry-over is always smaller than one packet.
+			area_id			fPlaybackScratchArea;
+			uint8*			fPlaybackScratch;
+			size_t			fPlaybackScratchStride;
+			uint8*			fPlaybackCarry;
+			size_t			fPlaybackCarryLength;
 			usb_iso_packet_descriptor* fDescriptors;
 			size_t			fDescriptorsCount;
 			uint8*			fBuffers;
@@ -59,6 +81,17 @@ protected:
 			size_t			fSamplesCount;
 
 			bigtime_t		fRealTime;
+			bigtime_t		fLastCompleteTime;
+
+			// TEMP DIAGNOSTIC counters (remove before upstreaming), collected
+			// in the completion callback and reported from Stop(): tracing to
+			// the log file from the callback is blocking file I/O on the host
+			// controller's completion thread and audibly disrupts the streams
+			// it is meant to observe.
+			uint32			fGapCount;
+			bigtime_t		fMaxGap;
+			uint32			fMediaLateCount;
+			uint32			fErrorCount;
 			uint32			fStartingFrame;
 			int32			fProcessedBuffers;
 			int32			fInsideNotify;
@@ -111,14 +144,20 @@ private:
 	static	void			_TransferCallback(void* cookie, status_t status,
 								void* data, size_t actualLength);
 			void			_InitFeedbackParams(uint32 rate);
+			bool			_ProbeVariableIsoOut(size_t stride);
+			void			_QueueWarmup();
+	static	void			_ProbeCallback(void* cookie, status_t status,
+									void* data, size_t actualLength);
 			size_t			_FillPlaybackPackets(
 								usb_iso_packet_descriptor* descriptors,
-								size_t frames, uint32 stride);
+								size_t frames, uint32 stride,
+								size_t& emitted);
 			status_t		_QueueFeedback();
 	static	void			_FeedbackCallback(void* cookie, status_t status,
 								void* data, size_t actualLength);
 			void			_ProcessFeedback(const uint8* data, size_t length);
 			void			_PublishImplicitFeedback(size_t actualLength);
+			size_t			_RepackCapture(void* scratch);
 			void			_DumpDescriptors();
 };
 

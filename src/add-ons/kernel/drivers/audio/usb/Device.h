@@ -53,8 +53,37 @@ public:
 			int32			Feedback();
 			bool			HasImplicitFeedbackSource()
 								{ return fImplicitFeedbackSource; }
-			void			SetImplicitFeedbackSource()
-								{ fImplicitFeedbackSource = true; }
+			void			SetImplicitFeedbackSource(uint8 interval)
+								{
+									fImplicitFeedbackSource = true;
+									fImplicitSourceInterval = interval;
+								}
+			uint8			ImplicitSourceInterval()
+								{ return fImplicitSourceInterval; }
+
+			// Besides the averaged rate above, the capture stream records the
+			// exact frame count of every isochronous packet the device
+			// delivered into this single-producer/single-consumer ring, and
+			// the playback stream sizes its outgoing packets by replaying
+			// them 1:1 (each entry is one service interval; 0 = errored
+			// packet). Playback then tracks the device's clock frame-for-
+			// frame with no estimation noise -- some devices (e.g. the
+			// Behringer UMC2xxHD family) audibly glitch on anything less
+			// exact. Producer and consumer both run in the USB stack's
+			// transfer-completion context; the indices are only ever advanced
+			// by their own side.
+			bool			PushFeedbackPacket(uint16 frames);
+			bool			PeekFeedbackPacket(uint16& frames);
+			void			PopFeedbackPacket();
+
+			// Cached result of the variable-length isochronous OUT capability
+			// probe (Stream::_ProbeVariableIsoOut): the capability belongs to
+			// the host controller path, not to a stream, and probing sends
+			// packets on the wire -- do it at most once per device.
+			int8			VariableIsoOutSupport()
+								{ return fVariableIsoOutSupport; }
+			void			SetVariableIsoOutSupport(bool supported)
+								{ fVariableIsoOutSupport = supported ? 1 : 0; }
 
 private:
 			status_t		_SetupEndpoints();
@@ -83,6 +112,16 @@ private:
 
 			int32			fFeedbackFrames;
 			bool			fImplicitFeedbackSource;
+			uint8			fImplicitSourceInterval;
+			int8			fVariableIsoOutSupport;
+
+			// Implicit-feedback packet-size ring; must be a power of two.
+			// 512 entries buffer ~64 ms of microframes, absorbing any
+			// scheduling skew between the two streams' completions.
+	static	const uint32	kFeedbackRingSize = 512;
+			uint16			fFeedbackRing[kFeedbackRingSize];
+			int32			fFeedbackRingHead;
+			int32			fFeedbackRingTail;
 
 // protected:
 			status_t		_MultiGetDescription(multi_description* Description);

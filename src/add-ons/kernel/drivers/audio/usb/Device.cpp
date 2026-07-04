@@ -25,6 +25,10 @@ Device::Device(usb_device device)
 	fAudioControl(this),
 	fFeedbackFrames(0),
 	fImplicitFeedbackSource(false),
+	fImplicitSourceInterval(0),
+	fVariableIsoOutSupport(-1),
+	fFeedbackRingHead(0),
+	fFeedbackRingTail(0),
 	fBuffersReadySem(-1)
 {
 	const usb_device_descriptor* deviceDescriptor
@@ -83,6 +87,40 @@ int32
 Device::Feedback()
 {
 	return atomic_get(&fFeedbackFrames);
+}
+
+
+bool
+Device::PushFeedbackPacket(uint16 frames)
+{
+	int32 head = atomic_get(&fFeedbackRingHead);
+	int32 tail = atomic_get(&fFeedbackRingTail);
+	if ((uint32)(head - tail) >= kFeedbackRingSize)
+		return false;
+
+	fFeedbackRing[(uint32)head & (kFeedbackRingSize - 1)] = frames;
+	atomic_set(&fFeedbackRingHead, head + 1);
+	return true;
+}
+
+
+bool
+Device::PeekFeedbackPacket(uint16& frames)
+{
+	int32 head = atomic_get(&fFeedbackRingHead);
+	int32 tail = atomic_get(&fFeedbackRingTail);
+	if (head - tail <= 0)
+		return false;
+
+	frames = fFeedbackRing[(uint32)tail & (kFeedbackRingSize - 1)];
+	return true;
+}
+
+
+void
+Device::PopFeedbackPacket()
+{
+	atomic_set(&fFeedbackRingTail, atomic_get(&fFeedbackRingTail) + 1);
 }
 
 
