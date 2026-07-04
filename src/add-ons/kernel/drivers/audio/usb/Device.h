@@ -116,9 +116,11 @@ private:
 			int8			fVariableIsoOutSupport;
 
 			// Implicit-feedback packet-size ring; must be a power of two.
-			// 512 entries buffer ~64 ms of microframes, absorbing any
-			// scheduling skew between the two streams' completions.
-	static	const uint32	kFeedbackRingSize = 512;
+			// 4096 entries buffer ~512 ms of microframes -- comfortably more
+			// than the sample buffers in flight (kSamplesBufferCount worth),
+			// so scheduling skew between the two streams' completions cannot
+			// overflow it and break the 1:1 packet mirroring.
+	static	const uint32	kFeedbackRingSize = 4096;
 			uint16			fFeedbackRing[kFeedbackRingSize];
 			int32			fFeedbackRingHead;
 			int32			fFeedbackRingTail;

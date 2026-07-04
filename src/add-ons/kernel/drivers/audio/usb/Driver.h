@@ -27,7 +27,11 @@ const uint32 kSamplesBufferSize = 2048;
 // ring, racing the controller's DMA. That window shrinks with the sample rate and
 // causes rate-dependent dropouts. Extra buffers give the media server a buffer to
 // fill ahead while the others play. (The media kit accepts 2..several here.)
-const uint32 kSamplesBufferCount = 4;
+// Eight buffers also ride out multi-buffer stalls of the host controller's
+// completion thread under system load, at the cost of added latency. Together
+// with the one-transfer startup warmup this must fit the host controller's
+// queued-transfers budget per endpoint (XHCI_MAX_TRANSFERS - 1).
+const uint32 kSamplesBufferCount = 8;
 
 
 extern usb_module_info* gUSBModule;
