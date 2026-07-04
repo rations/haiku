@@ -320,7 +320,10 @@
 // the spec says 1023, however this would cross the page boundary
 #define XHCI_MAX_SCRATCHPADS	256
 #define XHCI_MAX_DEVICES		128
-#define XHCI_MAX_TRANSFERS		8
+// Queued transfers per endpoint. Isochronous streaming drivers keep several
+// buffers in flight to ride out completion latency; 16 gives them headroom
+// at the cost of one more page of TRBs per device.
+#define XHCI_MAX_TRANSFERS		16
 
 
 struct xhci_trb {
