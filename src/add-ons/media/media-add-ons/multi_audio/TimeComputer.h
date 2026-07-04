@@ -14,6 +14,7 @@ struct TimeComputer {
 
 			void				Init(float frameRate, bigtime_t realBaseTime);
 			void				SetFrameRate(float frameRate);
+			void				ResetTimeBase();
 
 			void				AddTimeStamp(bigtime_t realTime, uint64 frames);
 

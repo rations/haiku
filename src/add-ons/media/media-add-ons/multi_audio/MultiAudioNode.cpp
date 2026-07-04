@@ -1786,6 +1786,8 @@ MultiAudioNode::_OutputThread()
 			system_time());
 	}
 
+	bool deviceFailed = false;
+
 	while (atomic_get(&fQuitThread) == 0) {
 		BAutolock locker(fBufferLock);
 			// make sure the buffers don't change while we're playing with them
@@ -1803,6 +1805,7 @@ MultiAudioNode::_OutputThread()
 			// != 1.0 makes BTimeSource::RealTimeFor() call debugger() once
 			// real time runs 2^24 us past the last published time. Then idle
 			// instead of busy looping on the dead device.
+			deviceFailed = true;
 			if (fTimeSourceStarted) {
 				PublishTime(fTimeComputer.PerformanceTime(),
 					fTimeComputer.RealTime(), 1.0f);
@@ -1810,6 +1813,17 @@ MultiAudioNode::_OutputThread()
 			locker.Unlock();
 			snooze(50000);
 			continue;
+		}
+
+		if (deviceFailed) {
+			// The device recovered (e.g. it was plugged back in and
+			// reattached). No frames advanced during the outage, so continue
+			// the performance time from the extrapolated present instead of
+			// the stale frame base: deriving it from the old base would
+			// publish a performance time far in the past and a collapsed
+			// drift, stalling everything slaved to this time source.
+			fTimeComputer.ResetTimeBase();
+			deviceFailed = false;
 		}
 
 		//PRINT(("MultiAudioNode::RunThread: buffer exchanged\n"));

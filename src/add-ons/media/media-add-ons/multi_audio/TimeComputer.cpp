@@ -48,6 +48,15 @@ TimeComputer::SetFrameRate(float frameRate)
 
 
 void
+TimeComputer::ResetTimeBase()
+{
+	fResetTimeBase = true;
+	fFirstEntry = 0;
+	fLastEntry = 0;
+}
+
+
+void
 TimeComputer::AddTimeStamp(bigtime_t realTime, uint64 frames)
 {
 	bigtime_t estimatedPerformanceTime = fPerformanceTime
