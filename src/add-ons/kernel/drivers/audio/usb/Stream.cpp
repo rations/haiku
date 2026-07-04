@@ -258,6 +258,11 @@ Stream::_SetupUAC2Rates()
 void
 Stream::OnRemove()
 {
+	// Streaming stopped with the device; marking it so also lets the next
+	// buffer exchange restart the stream if the device is plugged back in
+	// and reattached.
+	fIsRunning = false;
+
 	// the transfer callback schedule traffic - so we must ensure that we are
 	// not inside the callback anymore before returning, as we would otherwise
 	// violate the promise not to use any of the pipes after returning from the
@@ -567,6 +572,19 @@ Stream::OnSetConfiguration(usb_device device,
 	}
 
 	return B_OK;
+}
+
+
+status_t
+Stream::OnReattach(usb_device device, const usb_configuration_info* config)
+{
+	status_t status = OnSetConfiguration(device, config);
+	if (status != B_OK)
+		return status;
+
+	// The replugged device was power cycled and lost its sampling rate;
+	// program the selected rate again so streaming can just resume.
+	return _SetDeviceSamplingRate();
 }
 
 
@@ -1336,8 +1354,15 @@ Stream::SetGlobalFormat(multi_format_info* Format)
 	if (status != B_OK)
 		return status;
 
-	// set the sampling rate
+	return _SetDeviceSamplingRate();
+}
+
+
+status_t
+Stream::_SetDeviceSamplingRate()
+{
 	uint32 samplingRate = fAlternates[fActiveAlternate]->GetSamplingRate();
+	status_t status = B_OK;
 
 	if (fControlInterface->SpecReleaseNumber() >= 0x200) {
 		// R2: the rate is set with a Clock Source class request on the

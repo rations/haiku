@@ -32,6 +32,8 @@ public:
 
 			status_t		OnSetConfiguration(usb_device device,
 							const usb_configuration_info* config);
+			status_t		OnReattach(usb_device device,
+							const usb_configuration_info* config);
 
 			bool			ExchangeBuffer(multi_buffer_info* Info);
 			status_t		GetEnabledChannels(uint32& offset,
@@ -139,6 +141,7 @@ protected:
 private:
 			status_t		_ChooseAlternate();
 			status_t		_SetupUAC2Rates();
+			status_t		_SetDeviceSamplingRate();
 			status_t		_SetupBuffers();
 			status_t		_QueueNextTransfer(size_t buffer, bool start);
 	static	void			_TransferCallback(void* cookie, status_t status,

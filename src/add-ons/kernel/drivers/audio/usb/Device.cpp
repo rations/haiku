@@ -463,6 +463,13 @@ Device::Removed()
 
 	for (int i = 0; i < fStreams.Count(); i++)
 		fStreams[i]->OnRemove();
+
+	// The media add-on's exchange thread may be blocked waiting for a buffer
+	// that will never complete now; wake it so it sees the removal promptly
+	// (it holds its node lock while waiting -- left blocked, it wedges the
+	// whole media node).
+	if (fBuffersReadySem > B_OK)
+		release_sem_etc(fBuffersReadySem, 1, B_RELEASE_ALL);
 }
 
 
@@ -485,19 +492,43 @@ Device::CompareAndReattach(usb_device device)
 	}
 
 	if (deviceDescriptor->vendor_id != fVendorID
-		&& deviceDescriptor->product_id != fProductID)
+		|| deviceDescriptor->product_id != fProductID)
 		// this certainly isn't the same device
 		return B_BAD_VALUE;
 
 	// this is the same device that was replugged - clear the removed state,
-	// re- setup the endpoints and transfers and open the device if it was
-	// previously opened
+	// re-bind the existing streams (and with them the sample buffers already
+	// published to the consumer) to the new usb_device, and open the device
+	// if it was previously opened. _SetupEndpoints() must not run again here:
+	// it would create a second set of streams alongside the stale ones.
 	fDevice = device;
 	fRemoved = false;
-	status_t result = _SetupEndpoints();
+
+	const usb_configuration_info* config
+		= gUSBModule->get_nth_configuration(fDevice, 0);
+	status_t result = config != NULL ? B_OK : B_ERROR;
+	if (result == B_OK)
+		result = gUSBModule->set_configuration(fDevice, config);
+	for (int i = 0; result == B_OK && i < fStreams.Count(); i++)
+		result = fStreams[i]->OnReattach(fDevice, config);
 	if (result != B_OK) {
 		fRemoved = true;
 		return result;
+	}
+
+	// The replugged device starts with an empty FIFO; drop any feedback
+	// packets left from before the unplug so they cannot pace the restarted
+	// playback stream.
+	atomic_set(&fFeedbackRingHead, 0);
+	atomic_set(&fFeedbackRingTail, 0);
+
+	// Drain stale buffer-ready tokens (transfers that completed after the
+	// last exchange, and the removal wake-up); the restarted streams begin
+	// with no processed buffers.
+	if (fBuffersReadySem > B_OK) {
+		while (acquire_sem_etc(fBuffersReadySem, 1, B_RELATIVE_TIMEOUT, 0)
+				== B_OK)
+			;
 	}
 
 	// we need to setup hardware on device replug
@@ -753,6 +784,12 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
 		return B_BAD_ADDRESS;
 	}
 
+	// Fail promptly and predictably once the device is gone: the caller's
+	// thread must not be left blocked (it holds its node lock), and no new
+	// transfers may be queued on the dead pipes.
+	if (fRemoved)
+		return B_CANCELED;
+
 	for (int i = 0; i < fStreams.Count(); i++) {
 		if (!fStreams[i]->IsRunning())
 			fStreams[i]->Start();
@@ -764,6 +801,8 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
 		TRACE(ERR, "Timeout during buffers exchange.\n");
 		return status;
 	}
+	if (fRemoved)
+		return B_CANCELED;
 
 	status = B_ERROR;
 	for (int i = 0; i < fStreams.Count(); i++) {

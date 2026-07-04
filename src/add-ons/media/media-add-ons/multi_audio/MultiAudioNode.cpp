@@ -1791,7 +1791,26 @@ MultiAudioNode::_OutputThread()
 			// make sure the buffers don't change while we're playing with them
 
 		// send buffer
-		fDevice->BufferExchange(&bufferInfo);
+		status_t status = fDevice->BufferExchange(&bufferInfo);
+		if (status != B_OK) {
+			if (status == B_INTERRUPTED)
+				continue;
+
+			// The device won't deliver any more buffers, e.g. because it was
+			// unplugged. Publish the time one last time with a drift of 1.0,
+			// so that anything slaved to this time source keeps deriving sane
+			// times from the system clock: a time source frozen with a drift
+			// != 1.0 makes BTimeSource::RealTimeFor() call debugger() once
+			// real time runs 2^24 us past the last published time. Then idle
+			// instead of busy looping on the dead device.
+			if (fTimeSourceStarted) {
+				PublishTime(fTimeComputer.PerformanceTime(),
+					fTimeComputer.RealTime(), 1.0f);
+			}
+			locker.Unlock();
+			snooze(50000);
+			continue;
+		}
 
 		//PRINT(("MultiAudioNode::RunThread: buffer exchanged\n"));
 		//PRINT(("MultiAudioNode::RunThread: played_real_time: %lld\n", bufferInfo.played_real_time));
