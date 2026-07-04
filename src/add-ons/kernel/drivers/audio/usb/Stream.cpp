@@ -263,6 +263,17 @@ Stream::OnRemove()
 	// and reattached.
 	fIsRunning = false;
 
+	// TEMP DIAGNOSTIC (remove before upstreaming): the media add-on keeps
+	// the device open across the removal, so Stop() may never run and a
+	// reattach resets the counters; report the run here. This is the USB
+	// stack's notification thread, where a blocking trace is harmless.
+	if (fGapCount != 0 || fMediaLateCount != 0 || fErrorCount != 0) {
+		TRACE(ERR, "%s run summary: %" B_PRIu32 " completion gaps (max %"
+			B_PRIdBIGTIME " us), %" B_PRIu32 " media-late requeues, %"
+			B_PRIu32 " transfer errors\n", fIsInput ? "rec" : "pb",
+			fGapCount, fMaxGap, fMediaLateCount, fErrorCount);
+	}
+
 	// the transfer callback schedule traffic - so we must ensure that we are
 	// not inside the callback anymore before returning, as we would otherwise
 	// violate the promise not to use any of the pipes after returning from the
