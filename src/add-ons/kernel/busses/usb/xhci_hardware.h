@@ -312,7 +312,14 @@
 #define TRB_3_SLOT_GET(x)		(((x) >> 24) & 0xff)
 
 
-#define XHCI_MAX_EVENTS			(16 * 13)
+// The event ring must hold the events of every pending isochronous IN packet:
+// short packets post one Transfer Event each with BEI set, so no interrupt
+// drains the ring until a TD completes. An isochronous TD may carry hundreds
+// of packets (USB audio capture at 48 kHz queues 341 per transfer, all short),
+// which deterministically overflowed the previous 208-entry ring and silently
+// killed every completion on the bus. One segment may hold up to 4096 TRBs
+// (XHCI 1.2 § 6.5); 2048 costs 32 KiB and leaves ample slack.
+#define XHCI_MAX_EVENTS			(16 * 128)
 #define XHCI_MAX_COMMANDS		(16 * 1)
 #define XHCI_MAX_SLOTS			255
 #define XHCI_MAX_PORTS			127
