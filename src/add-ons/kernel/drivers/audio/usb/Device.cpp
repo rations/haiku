@@ -391,6 +391,16 @@ Device::Control(uint32 op, void* buffer, size_t length)
 			multi_buffer_list list;
 			if (user_memcpy(&list, buffer, sizeof(multi_buffer_list)) != B_OK)
 				return B_BAD_ADDRESS;
+
+			// The request counts size on-stack arrays below and come straight
+			// from userland; reject anything out of range before using them.
+			if (list.request_playback_buffers < 0
+				|| list.request_playback_buffers > kMaxRequestBuffers
+				|| list.request_record_buffers < 0
+				|| list.request_record_buffers > kMaxRequestBuffers) {
+				return B_BAD_VALUE;
+			}
+
 			buffer_desc **original_playback_descs = list.playback_buffers;
 			buffer_desc **original_record_descs = list.record_buffers;
 
@@ -804,6 +814,23 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
 	if (fRemoved)
 		return B_CANCELED;
 
+	// A fresh run starts when no stream is running (the first exchange after
+	// open, a force-stop or a format change). Drop whatever the previous run
+	// left behind before starting: ready-buffer tokens released after its
+	// last exchange would otherwise satisfy this acquire with no processed
+	// buffer to hand out (the exchange then fails instead of blocking), and
+	// leftover feedback-ring entries describe the old run's rate.
+	bool anyRunning = false;
+	for (int i = 0; i < fStreams.Count(); i++)
+		anyRunning = anyRunning || fStreams[i]->IsRunning();
+	if (!anyRunning) {
+		while (acquire_sem_etc(fBuffersReadySem, 1, B_RELATIVE_TIMEOUT, 0)
+				== B_OK)
+			;
+		atomic_set(&fFeedbackRingHead, 0);
+		atomic_set(&fFeedbackRingTail, 0);
+	}
+
 	for (int i = 0; i < fStreams.Count(); i++) {
 		if (!fStreams[i]->IsRunning())
 			fStreams[i]->Start();
@@ -811,8 +838,11 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
 
 	status_t status = acquire_sem_etc(fBuffersReadySem, 1,
 		B_CAN_INTERRUPT, 0);
-	if (status == B_TIMED_OUT) {
-		TRACE(ERR, "Timeout during buffers exchange.\n");
+	if (status != B_OK) {
+		// Interrupted (the caller is being signalled/killed) or timed out;
+		// hand the real reason to the caller instead of falling through and
+		// failing the exchange with a generic error.
+		TRACE(ERR, "Buffers exchange aborted: %#010x\n", status);
 		return status;
 	}
 	if (fRemoved)

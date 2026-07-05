@@ -82,6 +82,14 @@ protected:
 			size_t			fCurrentBuffer;
 			size_t			fSamplesCount;
 
+			// Buffer geometry requested by the consumer via
+			// B_MULTI_GET_BUFFERS (e.g. small buffers for a low-latency
+			// client). A zero frame request selects the kSamplesBufferSize
+			// default; the raw request is remembered so repeating it does
+			// not reallocate the buffers.
+			uint32			fBufferCount;
+			uint32			fRequestedFrames;
+
 			bigtime_t		fRealTime;
 			bigtime_t		fLastCompleteTime;
 

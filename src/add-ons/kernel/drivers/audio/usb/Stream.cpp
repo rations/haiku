@@ -44,6 +44,8 @@ Stream::Stream(Device* device, size_t interface, usb_interface_list* List)
 	fDescriptorsCount(0),
 	fCurrentBuffer(0),
 	fSamplesCount(0),
+	fBufferCount(kSamplesBufferCount),
+	fRequestedFrames(0),
 	fRealTime(0),
 	fLastCompleteTime(0),
 	fGapCount(0),
@@ -332,7 +334,38 @@ Stream::_SetupBuffers()
 		fDescriptors = NULL;
 	}
 
-	fAreaSize = sampleSize * kSamplesBufferSize * kSamplesBufferCount;
+	// Buffer geometry: fBufferCount buffers of the frame count the consumer
+	// requested via B_MULTI_GET_BUFFERS (0 = the kSamplesBufferSize default),
+	// cut down to a whole number of isochronous packets that also holds a
+	// whole number of frames (a packet may span a fractional frame count,
+	// e.g. at 44.1 kHz). Whole packets keep a non-feedback playback buffer
+	// exactly covered by its uniform packets and keep capture repacking
+	// sample-accurate; the packet count is bounded well below the host
+	// controller's per-transfer limit so feedback still has room to resize.
+	uint32 frames = fRequestedFrames != 0 ? fRequestedFrames
+		: kSamplesBufferSize;
+	if (frames > kMaxRequestFrames)
+		frames = kMaxRequestFrames;
+	size_t packets = (size_t)frames * sampleSize / packetSize;
+	if (packets < 2)
+		packets = 2;
+	if (packets > kMaxPacketsPerBuffer)
+		packets = kMaxPacketsPerBuffer;
+	while ((packets * packetSize) % sampleSize != 0
+			&& packets < kMaxPacketsPerBuffer + sampleSize)
+		packets++;
+	if ((packets * packetSize) % sampleSize != 0) {
+		TRACE(ERR, "No usable packet split for %" B_PRIuSIZE "-byte packets "
+			"of %" B_PRIu32 "-byte frames.\n", packetSize, sampleSize);
+		return B_BAD_VALUE;
+	}
+
+	fPacketsPerBuffer = packets;
+	fDescriptorsCount = fPacketsPerBuffer * fBufferCount;
+	fSamplesCount = fDescriptorsCount * packetSize / sampleSize;
+	TRACE(INF, "samplesCount:%d\n", fSamplesCount);
+
+	fAreaSize = fSamplesCount * sampleSize;
 	TRACE(INF, "estimate fAreaSize:%d\n", fAreaSize);
 
 	// round up to B_PAGE_SIZE and create area
@@ -361,17 +394,6 @@ Stream::_SetupBuffers()
 
 	TRACE(INF, "Created area id:%d at addr:%#010x size:%#010lx\n",
 		fArea, fDescriptors, fAreaSize);
-
-	fDescriptorsCount = fAreaSize / packetSize;
-	// we need same size sub-buffers. round it
-	fDescriptorsCount = ROUNDDOWN(fDescriptorsCount, kSamplesBufferCount);
-
-	// samples count - based on the nominal packet size; feedback only changes
-	// how the samples are split into packets, not how many a buffer holds.
-	fSamplesCount = fDescriptorsCount * packetSize / sampleSize;
-	TRACE(INF, "samplesCount:%d\n", fSamplesCount);
-
-	fPacketsPerBuffer = fDescriptorsCount / kSamplesBufferCount;
 
 	// Pace a playback stream from the capture stream's measured delivery rate:
 	// both run off the device's one crystal, so the capture rate is the device's
@@ -431,9 +453,9 @@ Stream::_SetupBuffers()
 		// nominal (see _QueueNextTransfer). The remainder is always smaller
 		// than one packet, so one extra wMaxPacketSize per buffer plus one
 		// for the carry itself is sufficient.
-		size_t bufferBytes = (fSamplesCount / kSamplesBufferCount) * sampleSize;
+		size_t bufferBytes = (fSamplesCount / fBufferCount) * sampleSize;
 		fPlaybackScratchStride = bufferBytes + fMaxPacketSize;
-		size_t scratchSize = fPlaybackScratchStride * kSamplesBufferCount
+		size_t scratchSize = fPlaybackScratchStride * fBufferCount
 			+ fMaxPacketSize;
 		scratchSize = (scratchSize + B_PAGE_SIZE - 1)
 			& ~(size_t)(B_PAGE_SIZE - 1);
@@ -447,11 +469,11 @@ Stream::_SetupBuffers()
 			return fStatus;
 		}
 		fPlaybackCarry = fPlaybackScratch
-			+ fPlaybackScratchStride * kSamplesBufferCount;
+			+ fPlaybackScratchStride * fBufferCount;
 		fPlaybackCarryLength = 0;
 	}
 
-	fDescriptorsCount = fPacketsPerBuffer * kSamplesBufferCount;
+	fDescriptorsCount = fPacketsPerBuffer * fBufferCount;
 	fDescriptors = new(std::nothrow)
 		usb_iso_packet_descriptor[fDescriptorsCount];
 	if (fDescriptors == NULL) {
@@ -643,7 +665,7 @@ Stream::Start()
 		if (!fIsInput && (fUseImplicitFeedback || fUseExplicitFeedback))
 			_QueueWarmup();
 
-		for (size_t i = 0; i < kSamplesBufferCount; i++)
+		for (size_t i = 0; i < fBufferCount; i++)
 			result = _QueueNextTransfer(i, i == 0);
 		fIsRunning = result == B_OK;
 	}
@@ -701,7 +723,7 @@ Stream::_QueueNextTransfer(size_t queuedBuffer, bool start)
 		fAlternates[fActiveAlternate]->Format());
 
 	uint32 stride = format->fNumChannels * format->fSubframeSize;
-	size_t frames = fSamplesCount / kSamplesBufferCount;
+	size_t frames = fSamplesCount / fBufferCount;
 	size_t bufferSize = frames * stride;
 
 	uint8* buffer = fKernelBuffers + bufferSize * queuedBuffer;
@@ -1154,10 +1176,10 @@ Stream::_RepackCapture(void* scratch)
 	if (stride == 0 || fMaxPacketSize == 0)
 		return 0;
 
-	size_t bufferSize = (fSamplesCount / kSamplesBufferCount) * stride;
+	size_t bufferSize = (fSamplesCount / fBufferCount) * stride;
 	size_t scratchStride = fPacketsPerBuffer * fMaxPacketSize;
 	size_t index = ((uint8*)scratch - fRecordScratch) / scratchStride;
-	if (index >= kSamplesBufferCount)
+	if (index >= fBufferCount)
 		return 0;
 
 	usb_iso_packet_descriptor* descriptors
@@ -1235,7 +1257,7 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
 			->GetSamplingRate();
 		if (rate > 0 && stream->fLastCompleteTime != 0) {
 			bigtime_t expected = (bigtime_t)(stream->fSamplesCount
-				/ kSamplesBufferCount) * 1000000 / rate;
+				/ stream->fBufferCount) * 1000000 / rate;
 			bigtime_t delta = now - stream->fLastCompleteTime;
 			if (delta > expected + expected / 2) {
 				stream->fGapCount++;
@@ -1262,19 +1284,20 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
 		stream->_PublishImplicitFeedback(delivered);
 
 	int32 pending = atomic_add(&stream->fProcessedBuffers, 1) + 1;
-	if (pending > (int32)kSamplesBufferCount)
+	if (pending > (int32)stream->fBufferCount)
 		TRACE(ERR, "Processed buffers overflow:%d\n", pending);
 	// TEMP DIAGNOSTIC (remove before upstreaming): with nearly every buffer
 	// still unfetched, the buffer about to be requeued has not been refilled
 	// by the media server -- stale audio goes out with no error status.
 	// Counted only; reported from Stop().
-	if (!stream->fIsInput && pending >= (int32)kSamplesBufferCount - 1)
+	if (!stream->fIsInput && pending >= (int32)stream->fBufferCount - 1)
 		stream->fMediaLateCount++;
 	stream->fRealTime = system_time();
 
 	release_sem_etc(stream->fDevice->fBuffersReadySem, 1, B_DO_NOT_RESCHEDULE);
 
-	stream->fCurrentBuffer = (stream->fCurrentBuffer + 1) % kSamplesBufferCount;
+	stream->fCurrentBuffer = (stream->fCurrentBuffer + 1)
+		% stream->fBufferCount;
 	status = stream->_QueueNextTransfer(stream->fCurrentBuffer, false);
 
 	atomic_add(&stream->fInsideNotify, -1);
@@ -1417,17 +1440,39 @@ Stream::_SetDeviceSamplingRate()
 status_t
 Stream::GetBuffers(multi_buffer_list* List)
 {
-// TODO: check the available buffers count!
 	if (fAreaSize == 0)
 		return B_NO_INIT;
+
+	// Apply the consumer's requested buffer geometry (e.g. a low-latency
+	// client asking for small buffers). A frame size of 0 selects the driver
+	// default, an out-of-range buffer count keeps the default count; the
+	// frame count is bounded further by _SetupBuffers(). Only a changed
+	// request reallocates the buffers.
+	int32 requestBuffers = fIsInput
+		? List->request_record_buffers : List->request_playback_buffers;
+	uint32 requestFrames = fIsInput
+		? List->request_record_buffer_size
+		: List->request_playback_buffer_size;
+
+	uint32 count = kSamplesBufferCount;
+	if (requestBuffers >= 2 && requestBuffers <= (int32)kSamplesBufferCount)
+		count = requestBuffers;
+
+	if (count != fBufferCount || requestFrames != fRequestedFrames) {
+		fBufferCount = count;
+		fRequestedFrames = requestFrames;
+		status_t status = _SetupBuffers();
+		if (status != B_OK)
+			return status;
+	}
 
 	int32 startChannel = List->return_playback_channels;
 	buffer_desc** Buffers = List->playback_buffers;
 
 	if (fIsInput) {
 		List->flags |= B_MULTI_BUFFER_RECORD;
-		List->return_record_buffer_size = fSamplesCount / kSamplesBufferCount;
-		List->return_record_buffers = kSamplesBufferCount;
+		List->return_record_buffer_size = fSamplesCount / fBufferCount;
+		List->return_record_buffers = fBufferCount;
 		startChannel = List->return_record_channels;
 		Buffers = List->record_buffers;
 
@@ -1436,8 +1481,8 @@ Stream::GetBuffers(multi_buffer_list* List)
 			List->return_record_buffer_size, List->return_record_buffers);
 	} else {
 		List->flags |= B_MULTI_BUFFER_PLAYBACK;
-		List->return_playback_buffer_size = fSamplesCount / kSamplesBufferCount;
-		List->return_playback_buffers = kSamplesBufferCount;
+		List->return_playback_buffer_size = fSamplesCount / fBufferCount;
+		List->return_playback_buffers = fBufferCount;
 
 		TRACE(DTA, "flags:%#10x\nreturn_playback_buffer_size:%#010x\n"
 			"return_playback_buffers:%#010x\n", List->flags,
@@ -1448,7 +1493,7 @@ Stream::GetBuffers(multi_buffer_list* List)
 		fAlternates[fActiveAlternate]->Format());
 
 	// [buffer][channel] init buffers
-	for (size_t buffer = 0; buffer < kSamplesBufferCount; buffer++) {
+	for (size_t buffer = 0; buffer < fBufferCount; buffer++) {
 		TRACE(DTA, "%s buffer #%d:\n", fIsInput ? "input" : "output", buffer + 1);
 
 		struct buffer_desc descs[format->fNumChannels];
@@ -1458,7 +1503,7 @@ Stream::GetBuffers(multi_buffer_list* List)
 			uint32 stride = format->fSubframeSize * format->fNumChannels;
 			descs[channel].stride = stride;
 
-			size_t bufferSize = (fSamplesCount / kSamplesBufferCount) * stride;
+			size_t bufferSize = (fSamplesCount / fBufferCount) * stride;
 			descs[channel].base = (char*)fBuffers;
 			descs[channel].base += buffer * bufferSize;
 			descs[channel].base += channel * format->fSubframeSize;
@@ -1494,11 +1539,11 @@ Stream::ExchangeBuffer(multi_buffer_info* Info)
 
 	if (fIsInput) {
 		Info->recorded_real_time = fRealTime;
-		Info->recorded_frames_count += fSamplesCount / kSamplesBufferCount;
+		Info->recorded_frames_count += fSamplesCount / fBufferCount;
 		Info->record_buffer_cycle = fCurrentBuffer;
 	} else {
 		Info->played_real_time = fRealTime;
-		Info->played_frames_count += fSamplesCount / kSamplesBufferCount;
+		Info->played_frames_count += fSamplesCount / fBufferCount;
 		Info->playback_buffer_cycle = fCurrentBuffer;
 	}
 

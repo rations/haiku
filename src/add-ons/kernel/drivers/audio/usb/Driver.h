@@ -17,9 +17,22 @@
 
 const char* const kVersion = "ver.0.0.5";
 
-// initial buffer size in samples
+// default buffer size in frames, used when the consumer does not request a
+// size of its own via B_MULTI_GET_BUFFERS
 const uint32 kSamplesBufferSize = 2048;
-// Number of sub-buffers cycled between the driver and the media server. Unlike a
+// Bounds for a consumer-requested buffer geometry (the request arrives from
+// userland and is untrusted). The packet bound stays below the host
+// controller's per-transfer packet limit (512 on XHCI) with room to spare,
+// since rate feedback re-splits a buffer into more, smaller packets when the
+// device runs slow.
+const uint32 kMaxRequestFrames = 16384;
+const uint32 kMaxPacketsPerBuffer = 384;
+// Upper bound for the buffer counts a B_MULTI_GET_BUFFERS request may carry;
+// they size on-stack arrays in the ioctl handler (the multi_audio add-on
+// requests 32).
+const int32 kMaxRequestBuffers = 32;
+// Default and maximum number of sub-buffers cycled between the driver and the
+// media server (B_MULTI_GET_BUFFERS may request fewer). Unlike a
 // PCI DMA card -- whose hardware loops over its buffers and hands each one back at
 // a buffer boundary -- this driver emulates the ring in software: an isochronous
 // completion re-queues its buffer immediately, so with only two buffers the media
