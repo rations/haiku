@@ -16,8 +16,11 @@ for driver in $(SYSTEM_ADD_ONS_DRIVERS_NET) {
 }
 
 # bootloaders
+# LOCAL BUILD TWEAK (not for upstream): package only the EFI loader. The
+# 32-bit BIOS/PXE loaders cannot be linked by the native x86_64 toolchain on
+# this machine (no 32-bit libgcc), and the target system boots EFI.
 local bootTarget ;
-for bootTarget in $(HAIKU_BOOT_TARGETS) {
+for bootTarget in efi {
 	AddFilesToPackage data platform_loaders : haiku_loader.$(bootTarget) ;
 }
 
