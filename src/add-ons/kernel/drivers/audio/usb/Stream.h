@@ -64,6 +64,16 @@ protected:
 			area_id			fRecordScratchArea;
 			uint8*			fRecordScratch;
 
+			// Continuous write position (bytes) into the record buffer ring and
+			// the last record buffer completely filled. The position carries
+			// across transfers because an asynchronous device delivers slightly
+			// more or fewer frames than nominal per transfer; resetting it per
+			// transfer would drop the surplus (or zero-pad the deficit) at
+			// every buffer seam. A record buffer is handed to the consumer only
+			// once it holds a full buffer of consecutive frames.
+			size_t			fRecordWritePos;
+			size_t			fRecordFillBuffer;
+
 			// Staging for a feedback-paced playback stream. Each outgoing
 			// transfer is assembled here as the sub-packet remainder of the
 			// previous transfer followed by the media buffer, so packets can
@@ -168,7 +178,8 @@ private:
 								void* data, size_t actualLength);
 			void			_ProcessFeedback(const uint8* data, size_t length);
 			void			_PublishImplicitFeedback(size_t actualLength);
-			size_t			_RepackCapture(void* scratch);
+			size_t			_RepackCapture(void* scratch,
+									size_t& buffersFilled);
 			void			_DumpDescriptors();
 };
 

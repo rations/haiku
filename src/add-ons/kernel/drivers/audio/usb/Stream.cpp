@@ -35,6 +35,8 @@ Stream::Stream(Device* device, size_t interface, usb_interface_list* List)
 	fAreaSize(0),
 	fRecordScratchArea(-1),
 	fRecordScratch(NULL),
+	fRecordWritePos(0),
+	fRecordFillBuffer(0),
 	fPlaybackScratchArea(-1),
 	fPlaybackScratch(NULL),
 	fPlaybackScratchStride(0),
@@ -497,6 +499,8 @@ Stream::_SetupBuffers()
 			return fStatus;
 		}
 		recordPacketSize = fMaxPacketSize;
+		fRecordWritePos = 0;
+		fRecordFillBuffer = 0;
 
 		size_t scratchSize = recordPacketSize * fDescriptorsCount;
 		scratchSize = (scratchSize + (B_PAGE_SIZE - 1)) &~ (B_PAGE_SIZE - 1);
@@ -640,6 +644,15 @@ Stream::Start()
 		// Likewise drop any staged remainder and schedule state from a
 		// previous run.
 		fPlaybackCarryLength = 0;
+		fRecordWritePos = 0;
+		fRecordFillBuffer = 0;
+
+		// The buffers are queued below in index order, and each completion
+		// requeues the buffer after the previous one; realign the index with
+		// that order (a previous run left it wherever it stopped). Starting
+		// misaligned double-queues a buffer that is still in flight and
+		// duplicates/skips one buffer of audio during the first ring lap.
+		fCurrentBuffer = fBufferCount - 1;
 		fFeedbackPhase = 0;
 		fLastCompleteTime = 0;
 		fGapCount = 0;
@@ -1148,27 +1161,34 @@ Stream::_PublishImplicitFeedback(size_t actualLength)
 
 
 size_t
-Stream::_RepackCapture(void* scratch)
+Stream::_RepackCapture(void* scratch, size_t& buffersFilled)
 {
 	// The isochronous IN packets were received at wMaxPacketSize stride into the
-	// scratch buffer; copy the frames the device actually delivered into the
-	// contiguous media record buffer. The record buffer is a fixed size, so a
-	// device delivering more than nominal is truncated here (its surplus is
-	// still counted for the rate estimate) and one delivering less is
-	// zero-padded.
+	// scratch buffer; append the frames the device actually delivered to the
+	// media record buffer ring at the continuous write position. The position
+	// deliberately carries across transfers: an asynchronous device runs on its
+	// own crystal and delivers slightly more or fewer frames than nominal per
+	// transfer, so pinning each transfer to one fixed-size record buffer would
+	// silently drop the surplus (or zero-pad the deficit) at every buffer seam
+	// -- an audible click although every USB transfer succeeded. Instead the
+	// frames flow contiguously across buffer boundaries, and a record buffer is
+	// reported ready (buffersFilled) only once it holds a full buffer of
+	// consecutive frames; the handover cadence then follows the device's true
+	// rate, just as a feedback-paced playback stream does.
 	// Returns the true delivered byte count (the sum of the per-packet
-	// actual_length values, each clamped to wMaxPacketSize). The caller uses
-	// this for the implicit-feedback rate estimate: it must come from the
-	// individual iso descriptors, not from the transfer's aggregate
-	// actualLength, because the host controller can report the latter as the
-	// sum of the requested (maximum) packet sizes rather than the bytes truly
-	// received (xHCI fills in request_length for packets it did not
-	// individually complete), which would double-count a lightly loaded stream.
-	// TODO: carry the surplus/deficit across buffers for sample-accurate
-	// capture; a fixed-size record buffer cannot express a drifting rate.
+	// actual_length values, each clamped to wMaxPacketSize and to whole
+	// frames). The caller uses this for the implicit-feedback rate estimate:
+	// it must come from the individual iso descriptors, not from the
+	// transfer's aggregate actualLength, because the host controller can
+	// report the latter as the sum of the requested (maximum) packet sizes
+	// rather than the bytes truly received (xHCI fills in request_length for
+	// packets it did not individually complete), which would double-count a
+	// lightly loaded stream.
 	TypeIFormatDescriptor* format = static_cast<TypeIFormatDescriptor*>(
 		fAlternates[fActiveAlternate]->Format());
 	uint32 stride = format->fNumChannels * format->fSubframeSize;
+
+	buffersFilled = 0;
 
 	if (fRecordScratch == NULL)
 		return 0;
@@ -1177,22 +1197,29 @@ Stream::_RepackCapture(void* scratch)
 		return 0;
 
 	size_t bufferSize = (fSamplesCount / fBufferCount) * stride;
+	size_t ringSize = bufferSize * fBufferCount;
 	size_t scratchStride = fPacketsPerBuffer * fMaxPacketSize;
 	size_t index = ((uint8*)scratch - fRecordScratch) / scratchStride;
-	if (index >= fBufferCount)
+	if (index >= fBufferCount || ringSize == 0)
 		return 0;
 
 	usb_iso_packet_descriptor* descriptors
 		= fDescriptors + index * fPacketsPerBuffer;
 	uint8* source = fRecordScratch + index * scratchStride;
-	uint8* target = fKernelBuffers + index * bufferSize;
+
+	if (fRecordWritePos >= ringSize)
+		fRecordWritePos = 0;
 
 	size_t delivered = 0;
-	size_t filled = 0;
 	for (size_t i = 0; i < fPacketsPerBuffer; i++) {
-		size_t length = descriptors[i].actual_length;
+		// An errored packet delivered no usable frames. A misbehaving device
+		// could also send a partial frame, which would knock every later
+		// sample off its channel alignment -- count whole frames only.
+		size_t length = descriptors[i].status == B_OK
+			? descriptors[i].actual_length : 0;
 		if (length > fMaxPacketSize)
 			length = fMaxPacketSize;
+		length -= length % stride;
 		delivered += length;
 
 		// Record every packet's frame count (0 for an errored packet) for
@@ -1201,22 +1228,27 @@ Stream::_RepackCapture(void* scratch)
 		// agnostic, so a differing playback channel count is fine. If the
 		// ring is full the entry is dropped; the playback stream falls back
 		// to its averaged rate and re-locks once entries flow again.
-		if (fIsFeedbackSource) {
-			fDevice->PushFeedbackPacket(descriptors[i].status == B_OK
-				? (uint16)(length / stride) : 0);
+		if (fIsFeedbackSource)
+			fDevice->PushFeedbackPacket((uint16)(length / stride));
+
+		const uint8* data = source + i * fMaxPacketSize;
+		while (length > 0) {
+			size_t space = bufferSize - fRecordWritePos % bufferSize;
+			size_t chunk = length < space ? length : space;
+			memcpy(fKernelBuffers + fRecordWritePos, data, chunk);
+			fRecordWritePos += chunk;
+			data += chunk;
+			length -= chunk;
+			if (chunk == space) {
+				// Crossed a buffer boundary: that buffer is complete. The
+				// position is a whole multiple of bufferSize here.
+				fRecordFillBuffer = fRecordWritePos / bufferSize - 1;
+				buffersFilled++;
+				if (fRecordWritePos == ringSize)
+					fRecordWritePos = 0;
+			}
 		}
-
-		if (filled >= bufferSize)
-			continue;
-		if (filled + length > bufferSize)
-			length = bufferSize - filled;
-		if (length > 0)
-			memcpy(target + filled, source + i * fMaxPacketSize, length);
-		filled += length;
 	}
-
-	if (filled < bufferSize)
-		memset(target + filled, 0, bufferSize - filled);
 
 	return delivered;
 }
@@ -1269,32 +1301,40 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
 	}
 
 	// Repack a completed capture buffer from the wMaxPacketSize-strided scratch
-	// into the contiguous media record buffer, before it is handed to the media
-	// server and before the delivered frame count is used to estimate the rate.
-	// The repack returns the true delivered byte count (summed from the
+	// into the contiguous media record buffer ring, before it is handed to the
+	// media server and before the delivered frame count is used to estimate the
+	// rate. The repack returns the true delivered byte count (summed from the
 	// per-packet iso descriptors); the transfer's aggregate actualLength is not
-	// a reliable byte count for a capture stream (see _RepackCapture).
+	// a reliable byte count for a capture stream (see _RepackCapture). Because
+	// the delivered frames flow continuously across buffer boundaries, one
+	// completed transfer finishes zero, one or (rarely) two record buffers; a
+	// playback transfer always finishes exactly its own buffer.
 	size_t delivered = actualLength;
+	size_t buffersFilled = 1;
 	if (stream->fIsInput)
-		delivered = stream->_RepackCapture(data);
+		delivered = stream->_RepackCapture(data, buffersFilled);
 
 	// A capture stream tagged as the implicit-feedback source paces the
 	// asynchronous playback stream from its own delivery rate.
 	if (stream->fIsFeedbackSource)
 		stream->_PublishImplicitFeedback(delivered);
 
-	int32 pending = atomic_add(&stream->fProcessedBuffers, 1) + 1;
-	if (pending > (int32)stream->fBufferCount)
-		TRACE(ERR, "Processed buffers overflow:%d\n", pending);
-	// TEMP DIAGNOSTIC (remove before upstreaming): with nearly every buffer
-	// still unfetched, the buffer about to be requeued has not been refilled
-	// by the media server -- stale audio goes out with no error status.
-	// Counted only; reported from Stop().
-	if (!stream->fIsInput && pending >= (int32)stream->fBufferCount - 1)
-		stream->fMediaLateCount++;
-	stream->fRealTime = system_time();
+	if (buffersFilled > 0) {
+		int32 pending = atomic_add(&stream->fProcessedBuffers,
+			(int32)buffersFilled) + (int32)buffersFilled;
+		if (pending > (int32)stream->fBufferCount)
+			TRACE(ERR, "Processed buffers overflow:%d\n", pending);
+		// TEMP DIAGNOSTIC (remove before upstreaming): with nearly every buffer
+		// still unfetched, the buffer about to be requeued has not been refilled
+		// by the media server -- stale audio goes out with no error status.
+		// Counted only; reported from Stop().
+		if (!stream->fIsInput && pending >= (int32)stream->fBufferCount - 1)
+			stream->fMediaLateCount++;
+		stream->fRealTime = system_time();
 
-	release_sem_etc(stream->fDevice->fBuffersReadySem, 1, B_DO_NOT_RESCHEDULE);
+		release_sem_etc(stream->fDevice->fBuffersReadySem,
+			(int32)buffersFilled, B_DO_NOT_RESCHEDULE);
+	}
 
 	stream->fCurrentBuffer = (stream->fCurrentBuffer + 1)
 		% stream->fBufferCount;
@@ -1540,7 +1580,10 @@ Stream::ExchangeBuffer(multi_buffer_info* Info)
 	if (fIsInput) {
 		Info->recorded_real_time = fRealTime;
 		Info->recorded_frames_count += fSamplesCount / fBufferCount;
-		Info->record_buffer_cycle = fCurrentBuffer;
+		// The freshest complete record buffer is tracked by the continuous
+		// repack fill, not by the USB transfer index: an asynchronous device's
+		// delivery drifts against the transfer boundaries.
+		Info->record_buffer_cycle = fRecordFillBuffer;
 	} else {
 		Info->played_real_time = fRealTime;
 		Info->played_frames_count += fSamplesCount / fBufferCount;
