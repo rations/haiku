@@ -112,6 +112,27 @@ protected:
 			bigtime_t		fMaxGap;
 			uint32			fMediaLateCount;
 			uint32			fErrorCount;
+
+			// TEMP DIAGNOSTIC (remove before upstreaming): timestamped ring of
+			// per-packet/per-transfer capture anomalies, recorded cheaply in
+			// the completion callback and dumped from Stop()/OnRemove() to
+			// correlate with audible pops. Kinds: 1 = packet status != B_OK,
+			// 2 = packet length not a frame multiple, 3 = packet length more
+			// than twice nominal (host-controller backfill / device burst),
+			// 4 = transfer short by more than one packet, 5 = transfer
+			// finished two record buffers, 6 = transfer finished none,
+			// 7 = mirror ring ran dry mid-transfer (mirroring disengaged to
+			// rebuild its cushion; value = packet index it went dry at).
+			struct DiagEvent {
+				bigtime_t	when;
+				uint32		kind;
+				uint32		value;
+			};
+			static const uint32 kDiagEvents = 64;
+			DiagEvent		fDiagEvents[kDiagEvents];
+			uint32			fDiagEventCount;
+			uint32			fDiagCounts[8];
+			bigtime_t		fDiagStartTime;
 			uint32			fStartingFrame;
 			int32			fProcessedBuffers;
 			int32			fInsideNotify;
@@ -132,6 +153,17 @@ protected:
 			bool			fIsFeedbackSource;
 			bool			fUseImplicitFeedback;
 			bool			fUseExplicitFeedback;
+
+			// Whether 1:1 mirroring of the capture packet sizes is currently
+			// active. Mirroring only engages once the feedback ring holds a
+			// cushion of entries, and disengages (to rebuild it) if the ring
+			// ever runs dry mid-transfer: with no cushion the ring idles at
+			// the empty boundary, where any delayed or reordered transfer
+			// completion starves a whole transfer of mirrored sizes and drops
+			// pacing back to the averaged rate -- an audible glitch on devices
+			// that need exact pacing. The entries are pacing metadata, so the
+			// cushion delays no audio.
+			bool			fMirrorEngaged;
 
 			// Running totals used by a capture feedback source to derive the
 			// device's true rate. Per-buffer frame counts are integers and so
@@ -180,6 +212,8 @@ private:
 			void			_PublishImplicitFeedback(size_t actualLength);
 			size_t			_RepackCapture(void* scratch,
 									size_t& buffersFilled);
+			void			_DiagRecord(uint32 kind, uint32 value);
+			void			_DiagDump();
 			void			_DumpDescriptors();
 };
 

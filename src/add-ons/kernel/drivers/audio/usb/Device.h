@@ -73,6 +73,7 @@ public:
 			// transfer-completion context; the indices are only ever advanced
 			// by their own side.
 			bool			PushFeedbackPacket(uint16 frames);
+			uint32			FeedbackRingUsed();
 			bool			PeekFeedbackPacket(uint16& frames);
 			void			PopFeedbackPacket();
 

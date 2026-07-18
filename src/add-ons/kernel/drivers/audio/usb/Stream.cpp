@@ -54,6 +54,8 @@ Stream::Stream(Device* device, size_t interface, usb_interface_list* List)
 	fMaxGap(0),
 	fMediaLateCount(0),
 	fErrorCount(0),
+	fDiagEventCount(0),
+	fDiagStartTime(0),
 	fStartingFrame(0),
 	fProcessedBuffers(0),
 	fInsideNotify(0),
@@ -61,6 +63,7 @@ Stream::Stream(Device* device, size_t interface, usb_interface_list* List)
 	fIsFeedbackSource(false),
 	fUseImplicitFeedback(false),
 	fUseExplicitFeedback(false),
+	fMirrorEngaged(false),
 	fCaptureFramesTotal(0),
 	fCapturePacketsTotal(0),
 	fFeedbackEndpoint(0),
@@ -277,6 +280,7 @@ Stream::OnRemove()
 			B_PRIu32 " transfer errors\n", fIsInput ? "rec" : "pb",
 			fGapCount, fMaxGap, fMediaLateCount, fErrorCount);
 	}
+	_DiagDump();
 
 	// the transfer callback schedule traffic - so we must ensure that we are
 	// not inside the callback anymore before returning, as we would otherwise
@@ -646,6 +650,12 @@ Stream::Start()
 		fPlaybackCarryLength = 0;
 		fRecordWritePos = 0;
 		fRecordFillBuffer = 0;
+		fMirrorEngaged = false;
+
+		// TEMP DIAGNOSTIC (remove before upstreaming).
+		fDiagEventCount = 0;
+		memset(fDiagCounts, 0, sizeof(fDiagCounts));
+		fDiagStartTime = system_time();
 
 		// The buffers are queued below in index order, and each completion
 		// requeues the buffer after the previous one; realign the index with
@@ -704,6 +714,7 @@ Stream::Stop()
 				B_PRIu32 " transfer errors\n", fIsInput ? "rec" : "pb",
 				fGapCount, fMaxGap, fMediaLateCount, fErrorCount);
 		}
+		_DiagDump();
 	}
 	if (fFeedbackEndpoint != 0)
 		gUSBModule->cancel_queued_transfers(fFeedbackEndpoint);
@@ -932,6 +943,24 @@ Stream::_FillPlaybackPackets(usb_iso_packet_descriptor* descriptors,
 	emitted = 0;
 	size_t count = 0;
 
+	// Engage 1:1 mirroring only once the feedback ring holds a cushion of
+	// entries. Without one the ring idles at its empty boundary (playback
+	// consumes entries exactly as fast as capture produces them), and any
+	// delayed or reordered completion then starves a whole transfer of
+	// mirrored sizes, dropping it to the averaged rate -- an audible glitch
+	// on devices that need exact pacing. The cushion is sized to ride out
+	// tens of milliseconds of completion jitter; entries are pacing
+	// metadata, so consuming them late delays no audio and the replayed
+	// rate is unchanged.
+	if (fUseImplicitFeedback && !fMirrorEngaged
+			&& fDevice->ImplicitSourceInterval() == fDataInterval) {
+		uint32 threshold = 200u >> fDataInterval;	// ~25 ms of intervals
+		if (threshold < (uint32)fPacketsPerBuffer)
+			threshold = (uint32)fPacketsPerBuffer;
+		if (fDevice->FeedbackRingUsed() >= threshold)
+			fMirrorEngaged = true;
+	}
+
 	// Cut whole packets off the staged frames. An implicit feedback sink
 	// preferably replays the frame count of each packet the capture stream
 	// delivered, 1:1 -- each ring entry stands for one service interval, so
@@ -948,13 +977,21 @@ Stream::_FillPlaybackPackets(usb_iso_packet_descriptor* descriptors,
 	// worst (slowest) case, so this cannot overrun the descriptor array.
 	while (count < fPacketsPerBuffer) {
 		uint32 packetFrames;
-		uint16 mirrored;
-		// Mirroring maps ring entries to service intervals 1:1, so it is
-		// only exact when both endpoints share the same interval; fall back
-		// to the averaged rate otherwise.
-		bool useMirrored = fUseImplicitFeedback
-			&& fDevice->ImplicitSourceInterval() == fDataInterval
-			&& fDevice->PeekFeedbackPacket(mirrored);
+		uint16 mirrored = 0;
+		// Mirroring maps ring entries to service intervals 1:1 (it is only
+		// exact when both endpoints share the same interval, checked at
+		// engagement above).
+		bool useMirrored = false;
+		if (fMirrorEngaged) {
+			useMirrored = fDevice->PeekFeedbackPacket(mirrored);
+			if (!useMirrored) {
+				// The ring ran dry mid-transfer (a stalled or reordered
+				// completion ate the cushion): disengage and size packets
+				// from the averaged rate until the cushion has rebuilt.
+				fMirrorEngaged = false;
+				_DiagRecord(7, (uint32)count);
+			}
+		}
 		uint32 demand = 0;
 		if (useMirrored && mirrored == 0) {
 			// The host missed that interval (errored capture packet), but the
@@ -1160,6 +1197,49 @@ Stream::_PublishImplicitFeedback(size_t actualLength)
 }
 
 
+void
+Stream::_DiagRecord(uint32 kind, uint32 value)
+{
+	// TEMP DIAGNOSTIC (remove before upstreaming): callback-safe anomaly
+	// recorder -- plain memory writes only, no I/O, no locking (records are
+	// only appended from this stream's completion callback).
+	if (kind < 8)
+		fDiagCounts[kind]++;
+	if (fDiagEventCount < kDiagEvents) {
+		fDiagEvents[fDiagEventCount].when = system_time();
+		fDiagEvents[fDiagEventCount].kind = kind;
+		fDiagEvents[fDiagEventCount].value = value;
+		fDiagEventCount++;
+	}
+}
+
+
+void
+Stream::_DiagDump()
+{
+	// TEMP DIAGNOSTIC (remove before upstreaming): report from a context
+	// where blocking traces are harmless (Stop()/OnRemove(), never the
+	// completion callback).
+	bool any = false;
+	for (uint32 i = 1; i < 8; i++)
+		any = any || fDiagCounts[i] != 0;
+	if (!any)
+		return;
+
+	TRACE(ERR, "%s diag: status %" B_PRIu32 " unalign %" B_PRIu32 " oversize %"
+		B_PRIu32 " short %" B_PRIu32 " twofill %" B_PRIu32 " zerofill %"
+		B_PRIu32 " mirrordry %" B_PRIu32 "\n", fIsInput ? "rec" : "pb",
+		fDiagCounts[1], fDiagCounts[2], fDiagCounts[3], fDiagCounts[4],
+		fDiagCounts[5], fDiagCounts[6], fDiagCounts[7]);
+	for (uint32 i = 0; i < fDiagEventCount; i++) {
+		TRACE(ERR, "%s diag evt +%" B_PRIdBIGTIME "ms kind %" B_PRIu32
+			" value %" B_PRIu32 "\n", fIsInput ? "rec" : "pb",
+			(fDiagEvents[i].when - fDiagStartTime) / 1000,
+			fDiagEvents[i].kind, fDiagEvents[i].value);
+	}
+}
+
+
 size_t
 Stream::_RepackCapture(void* scratch, size_t& buffersFilled)
 {
@@ -1210,6 +1290,12 @@ Stream::_RepackCapture(void* scratch, size_t& buffersFilled)
 	if (fRecordWritePos >= ringSize)
 		fRecordWritePos = 0;
 
+	// TEMP DIAGNOSTIC (remove before upstreaming): nominal packet size, for
+	// anomaly classification only.
+	uint32 diagRate = fAlternates[fActiveAlternate]->GetSamplingRate();
+	size_t diagNominal = (size_t)diagRate * stride
+		/ (fDevice->fUSBVersion < 0x0200 ? 1000 : 8000);
+
 	size_t delivered = 0;
 	for (size_t i = 0; i < fPacketsPerBuffer; i++) {
 		// An errored packet delivered no usable frames. A misbehaving device
@@ -1217,6 +1303,12 @@ Stream::_RepackCapture(void* scratch, size_t& buffersFilled)
 		// sample off its channel alignment -- count whole frames only.
 		size_t length = descriptors[i].status == B_OK
 			? descriptors[i].actual_length : 0;
+		if (descriptors[i].status != B_OK)
+			_DiagRecord(1, (uint32)descriptors[i].status);
+		if (length % stride != 0)
+			_DiagRecord(2, (uint32)length);
+		if (diagNominal > 0 && length > 2 * diagNominal)
+			_DiagRecord(3, (uint32)length);
 		if (length > fMaxPacketSize)
 			length = fMaxPacketSize;
 		length -= length % stride;
@@ -1249,6 +1341,15 @@ Stream::_RepackCapture(void* scratch, size_t& buffersFilled)
 			}
 		}
 	}
+
+	// TEMP DIAGNOSTIC (remove before upstreaming): per-transfer anomalies.
+	if (diagNominal > 0
+			&& delivered + diagNominal < diagNominal * fPacketsPerBuffer)
+		_DiagRecord(4, (uint32)delivered);
+	if (buffersFilled >= 2)
+		_DiagRecord(5, (uint32)buffersFilled);
+	if (buffersFilled == 0)
+		_DiagRecord(6, (uint32)(fRecordWritePos % bufferSize));
 
 	return delivered;
 }
@@ -1488,6 +1589,13 @@ Stream::GetBuffers(multi_buffer_list* List)
 	// default, an out-of-range buffer count keeps the default count; the
 	// frame count is bounded further by _SetupBuffers(). Only a changed
 	// request reallocates the buffers.
+	// The returned buffer count must never exceed the requested one (when a
+	// request was made): the caller marshalled exactly that many buffer_desc
+	// row pointers. A consumer wanting extra record-ring slack -- the record
+	// buffers fill continuously at the device's own rate, so reading one
+	// buffer per playback period needs slack for the occasional period in
+	// which two buffers complete -- requests a deeper record ring than its
+	// playback ring; ring depth is overwrite slack, not latency.
 	int32 requestBuffers = fIsInput
 		? List->request_record_buffers : List->request_playback_buffers;
 	uint32 requestFrames = fIsInput

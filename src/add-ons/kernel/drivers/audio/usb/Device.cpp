@@ -104,6 +104,15 @@ Device::PushFeedbackPacket(uint16 frames)
 }
 
 
+uint32
+Device::FeedbackRingUsed()
+{
+	int32 head = atomic_get(&fFeedbackRingHead);
+	int32 tail = atomic_get(&fFeedbackRingTail);
+	return (uint32)(head - tail);
+}
+
+
 bool
 Device::PeekFeedbackPacket(uint16& frames)
 {
@@ -394,9 +403,14 @@ Device::Control(uint32 op, void* buffer, size_t length)
 
 			// The request counts size on-stack arrays below and come straight
 			// from userland; reject anything out of range before using them.
+			// A request of exactly 1 is rejected too: the stream code never
+			// returns fewer than 2 buffers, so it would write one more
+			// buffer_desc row than the caller marshalled.
 			if (list.request_playback_buffers < 0
+				|| list.request_playback_buffers == 1
 				|| list.request_playback_buffers > kMaxRequestBuffers
 				|| list.request_record_buffers < 0
+				|| list.request_record_buffers == 1
 				|| list.request_record_buffers > kMaxRequestBuffers) {
 				return B_BAD_VALUE;
 			}
@@ -848,11 +862,20 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
 	if (fRemoved)
 		return B_CANCELED;
 
+	// Serve record streams first: their reported buffer cycle tracks the
+	// continuous fill position, and consuming a pending record buffer before
+	// the playback buffer of the same period keeps that report fresh for a
+	// consumer pacing itself on the playback stream (it reads the capture
+	// buffer the same cycle).
 	status = B_ERROR;
-	for (int i = 0; i < fStreams.Count(); i++) {
-		if (fStreams[i]->ExchangeBuffer(&Info)) {
-			status = B_OK;
-			break;
+	for (int pass = 0; pass < 2 && status != B_OK; pass++) {
+		for (int i = 0; i < fStreams.Count(); i++) {
+			if (fStreams[i]->IsInput() != (pass == 0))
+				continue;
+			if (fStreams[i]->ExchangeBuffer(&Info)) {
+				status = B_OK;
+				break;
+			}
 		}
 	}
 
