@@ -365,9 +365,7 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fEventIdx(0),
 		fCmdIdx(0),
 		fEventCcs(1),
-		fCmdCcs(1),
-		fLastTransferErrorLog(0),
-		fTransferErrorCount(0)
+		fCmdCcs(1)
 {
 	B_INITIALIZE_SPINLOCK(&fSpinlock);
 	mutex_init(&fFinishedLock, "XHCI finished transfers");
@@ -2104,6 +2102,8 @@ XHCI::_InsertEndpointForPipe(Pipe *pipe)
 		endpoint->td_head = NULL;
 		endpoint->used = 0;
 		endpoint->next = 0;
+		endpoint->last_error_log = 0;
+		endpoint->error_count = 0;
 
 		endpoint->trbs = device->trbs + id * XHCI_ENDPOINT_RING_SIZE;
 		endpoint->trb_addr = device->trb_addr
@@ -2884,16 +2884,18 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 		// each one delays this handler enough to miss further intervals, which
 		// produces yet more errors: the reporting becomes self-sustaining and
 		// starves the rest of the system. Report at most once a second per
-		// controller and count what was suppressed in between, so a persistent
-		// failure is still obvious without wedging the machine.
-		fTransferErrorCount++;
+		// endpoint and count what was suppressed in between, so a persistent
+		// failure is still obvious without wedging the machine. Per endpoint
+		// rather than per controller, so the reported rate belongs to the
+		// endpoint named in the message.
+		endpoint->error_count++;
 		const bigtime_t now = system_time();
-		if ((now - fLastTransferErrorLog) >= 1000000) {
+		if ((now - endpoint->last_error_log) >= 1000000) {
 			TRACE_ALWAYS("transfer error on slot %" B_PRId8 " endpoint %" B_PRId8
-				": %s (%" B_PRIu32 " since last report)\n", slot, endpointNumber,
-				xhci_error_string(completionCode), fTransferErrorCount);
-			fLastTransferErrorLog = now;
-			fTransferErrorCount = 0;
+				": %s (%" B_PRIu32 " in the last second)\n", slot, endpointNumber,
+				xhci_error_string(completionCode), endpoint->error_count);
+			endpoint->last_error_log = now;
+			endpoint->error_count = 0;
 		}
 	}
 

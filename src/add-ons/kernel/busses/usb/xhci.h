@@ -65,6 +65,11 @@ typedef struct xhci_endpoint {
 
 	xhci_trb*		trbs; // [XHCI_ENDPOINT_RING_SIZE]
 	phys_addr_t 	trb_addr;
+
+	// Rate limiting for transfer error reports; see HandleTransferComplete().
+	// Accessed only there, under "lock".
+	bigtime_t		last_error_log;
+	uint32			error_count;
 } xhci_endpoint;
 
 
@@ -288,11 +293,6 @@ private:
 			uint16				fCmdIdx;
 			uint8				fEventCcs;
 			uint8				fCmdCcs;
-
-			// Rate limiting for transfer error reports, see
-			// HandleTransferComplete(). Touched only from the event handler.
-			bigtime_t			fLastTransferErrorLog;
-			uint32				fTransferErrorCount;
 
 			uint32				fExitLatMax;
 };
