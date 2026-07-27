@@ -289,6 +289,11 @@ private:
 			uint8				fEventCcs;
 			uint8				fCmdCcs;
 
+			// Rate limiting for transfer error reports, see
+			// HandleTransferComplete(). Touched only from the event handler.
+			bigtime_t			fLastTransferErrorLog;
+			uint32				fTransferErrorCount;
+
 			uint32				fExitLatMax;
 };
 

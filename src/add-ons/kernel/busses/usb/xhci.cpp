@@ -365,7 +365,9 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fEventIdx(0),
 		fCmdIdx(0),
 		fEventCcs(1),
-		fCmdCcs(1)
+		fCmdCcs(1),
+		fLastTransferErrorLog(0),
+		fTransferErrorCount(0)
 {
 	B_INITIALIZE_SPINLOCK(&fSpinlock);
 	mutex_init(&fFinishedLock, "XHCI finished transfers");
@@ -2877,8 +2879,22 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 
 	if (completionCode != COMP_SUCCESS && completionCode != COMP_SHORT_PACKET
 			&& completionCode != COMP_STOPPED && completionCode != COMP_STOPPED_LENGTH_INVALID) {
-		TRACE_ALWAYS("transfer error on slot %" B_PRId8 " endpoint %" B_PRId8
-			": %s\n", slot, endpointNumber, xhci_error_string(completionCode));
+		// A failing isochronous endpoint reports an error every service
+		// interval, so this is reachable thousands of times a second. Logging
+		// each one delays this handler enough to miss further intervals, which
+		// produces yet more errors: the reporting becomes self-sustaining and
+		// starves the rest of the system. Report at most once a second per
+		// controller and count what was suppressed in between, so a persistent
+		// failure is still obvious without wedging the machine.
+		fTransferErrorCount++;
+		const bigtime_t now = system_time();
+		if ((now - fLastTransferErrorLog) >= 1000000) {
+			TRACE_ALWAYS("transfer error on slot %" B_PRId8 " endpoint %" B_PRId8
+				": %s (%" B_PRIu32 " since last report)\n", slot, endpointNumber,
+				xhci_error_string(completionCode), fTransferErrorCount);
+			fLastTransferErrorLog = now;
+			fTransferErrorCount = 0;
+		}
 	}
 
 	phys_addr_t source = B_LENDIAN_TO_HOST_INT64(trb->address);
