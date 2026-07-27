@@ -92,6 +92,12 @@ typedef struct xhci_endpoint {
 	// Accessed only there, under "lock".
 	bigtime_t		last_error_log;
 	uint32			error_count;
+
+	// Rate limiting for the report of an isochronous schedule that had to be
+	// re-anchored, and how many were suppressed in between. Written only by
+	// _ScheduleIsochronousTDs(), under "lock".
+	bigtime_t		last_frame_log;
+	uint32			reanchor_count;
 } xhci_endpoint;
 
 

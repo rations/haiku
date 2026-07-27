@@ -112,6 +112,7 @@ protected:
 			bigtime_t		fMaxGap;
 			uint32			fMediaLateCount;
 			uint32			fErrorCount;
+			bigtime_t		fLastErrorTrace;
 
 			// TEMP DIAGNOSTIC (remove before upstreaming): timestamped ring of
 			// per-packet/per-transfer capture anomalies, recorded cheaply in

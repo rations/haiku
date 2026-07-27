@@ -1390,6 +1390,25 @@ XHCI::_ScheduleIsochronousTDs(xhci_endpoint* endpoint, xhci_td* td,
 		// A fresh stream, or one that fell behind: anchor at the first frame
 		// the controller can still execute. A TD that begins a frame's run of
 		// shared Frame IDs must be the first of that run.
+		//
+		// A stream that keeps arriving here is not merely starting: its ring is
+		// running dry, so report the geometry that produced the schedule. This
+		// path is reachable once per transfer on a failing endpoint, so it is
+		// rate limited the same way transfer errors are.
+		endpoint->reanchor_count++;
+		const bigtime_t now = system_time();
+		if ((now - endpoint->last_frame_log) >= 1000000) {
+			TRACE_ALWAYS("isochronous schedule re-anchored on slot %" B_PRId8
+				" endpoint %" B_PRId8 ": %" B_PRIu32 " packet(s), interval %" B_PRIu8
+				" (%" B_PRIu32 " TD(s)/frame, %" B_PRIu32 " frame(s)/TD), frame %"
+				B_PRIu32 " -> %" B_PRIu32 " (%" B_PRIu32 " in the last second)\n",
+				endpoint->device->slot, endpoint->id + 1, packetCount,
+				endpoint->interval, tdsPerFrame, framesPerTD, currentFrame,
+				startFrame, endpoint->reanchor_count);
+			endpoint->last_frame_log = now;
+			endpoint->reanchor_count = 0;
+		}
+
 		frame = startFrame;
 		used = 0;
 	}
@@ -2259,6 +2278,8 @@ XHCI::_InsertEndpointForPipe(Pipe *pipe)
 		endpoint->next_frame = 0;
 		endpoint->last_error_log = 0;
 		endpoint->error_count = 0;
+		endpoint->last_frame_log = 0;
+		endpoint->reanchor_count = 0;
 
 		endpoint->trbs = device->trbs + id * XHCI_ENDPOINT_RING_SIZE;
 		endpoint->trb_addr = device->trb_addr
@@ -3030,6 +3051,18 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 		// These occur on isochronous endpoints when there is no TRB ready to be
 		// executed at the appropriate time. (XHCI 1.2 § 4.10.3.1 p204.)
 		endpoint->status = completionCode;
+
+		// The endpoint has also been taken off the controller's pipe schedule,
+		// and only goes back on it when the endpoint's doorbell is next rung:
+		// the isochronous data flow this endpoint was running has ended. The
+		// Frame IDs that follow therefore begin a new flow rather than continue
+		// the old one, so drop the schedule the next transfer would otherwise
+		// have been appended to. Continuing it would hand the controller frames
+		// it has already passed, which it answers by advancing through the ring
+		// faster than the service interval to resynchronize -- emptying the ring
+		// sooner and causing the next overrun. (XHCI 1.2 § 4.10.3.1 p205,
+		// § 4.11.2.5.1 p200, § 4.11.2.5.2 p201.)
+		endpoint->frame_valid = false;
 		return;
 	}
 

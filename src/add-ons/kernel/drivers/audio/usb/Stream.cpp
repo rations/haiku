@@ -54,6 +54,7 @@ Stream::Stream(Device* device, size_t interface, usb_interface_list* List)
 	fMaxGap(0),
 	fMediaLateCount(0),
 	fErrorCount(0),
+	fLastErrorTrace(0),
 	fDiagEventCount(0),
 	fDiagStartTime(0),
 	fStartingFrame(0),
@@ -669,6 +670,7 @@ Stream::Start()
 		fMaxGap = 0;
 		fMediaLateCount = 0;
 		fErrorCount = 0;
+		fLastErrorTrace = 0;
 
 		// Mark running before queuing so completion callbacks re-queue.
 		fIsRunning = true;
@@ -1361,9 +1363,24 @@ Stream::_TransferCallback(void* cookie, status_t status, void* data,
 {
 	Stream* stream = (Stream*)cookie;
 
-	TRACE(status == B_OK ? DTA : ERR,
-		"stream:%010x: status:%#010x, data:%#010x, len:%d\n",
-		stream->fStreamEndpoint, status, data, actualLength);
+	// A stream whose endpoint is failing reports an error on every completion,
+	// which is once per transfer for the whole life of the stream. Tracing each
+	// one is blocking file I/O on the host controller's completion thread: it
+	// delays the thread enough to miss further transfers, which produces yet
+	// more errors, so the tracing sustains itself and starves the rest of the
+	// system. Trace at most one error per second per stream; the total is
+	// counted below and reported from Stop().
+	if (status == B_OK) {
+		TRACE(DTA, "stream:%010x: status:%#010x, data:%#010x, len:%d\n",
+			stream->fStreamEndpoint, status, data, actualLength);
+	} else {
+		bigtime_t now = system_time();
+		if (now - stream->fLastErrorTrace >= 1000000) {
+			stream->fLastErrorTrace = now;
+			TRACE(ERR, "stream:%010x: status:%#010x, data:%#010x, len:%d\n",
+				stream->fStreamEndpoint, status, data, actualLength);
+		}
+	}
 
 	atomic_add(&stream->fInsideNotify, 1);
 	if (status == B_CANCELED || stream->fDevice->fRemoved || !stream->fIsRunning) {
