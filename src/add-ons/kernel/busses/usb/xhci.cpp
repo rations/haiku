@@ -357,6 +357,8 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fSlotCount(0),
 		fScratchpadCount(0),
 		fContextSizeShift(0),
+		fUseFrameID(false),
+		fISTFrames(0),
 		fFinishedHead(NULL),
 		fFinishTransfersSem(-1),
 		fFinishThread(-1),
@@ -695,6 +697,26 @@ XHCI::Start()
 	uint32 params3 = ReadCapReg32(XHCI_HCSPARAMS3);
 	fExitLatMax = HCS_U1_DEVICE_LATENCY(params3)
 		+ HCS_U2_DEVICE_LATENCY(params3);
+
+	// The Isochronous Scheduling Threshold is the minimum distance in time that
+	// software must stay ahead of the controller when posting isochronous work.
+	// Bit 3 selects the unit -- frames when set, microframes when clear -- and
+	// the Frame ID rules want it rounded up to whole frames.
+	// (XHCI 1.2 § 5.3.4 and § 4.11.2.5.)
+	uint32 ist = HCS_IST(params2);
+	if ((ist & 0x8) != 0)
+		fISTFrames = ist & 0x7;
+	else
+		fISTFrames = ((ist & 0x7) + 7) / 8;
+
+	// Contiguous Frame ID Capability. When the controller has it, every Isoch
+	// TD is expected to carry a Frame ID, which the controller matches against
+	// MFINDEX; that match is what lets it resynchronize an isochronous pipe
+	// after a Missed Service Error. CFC is mandatory for xHCI 1.1 and later.
+	// (XHCI 1.2 § 4.11.2.5.) See _ScheduleIsochronousTDs().
+	fUseFrameID = HCC_CFC(cparams) != 0;
+	TRACE_ALWAYS("isochronous scheduling: frame IDs %srequired, IST %"
+		B_PRIu32 " frame(s)\n", fUseFrameID ? "" : "not ", fISTFrames);
 
 	// clear interrupts & disable device notifications
 	WriteOpReg(XHCI_STS, ReadOpReg(XHCI_STS));
@@ -1085,22 +1107,16 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 		// TODO: We do not currently take Mult into account at all!
 		// How are we supposed to do that here?
 
-		// Determine the (starting) frame number: if ISO_ASAP is set,
-		// we are queueing this "right away", and so want to reset
-		// the starting_frame_number. Otherwise we use the passed one.
-		uint32 frame;
-		if ((isochronousData->flags & USB_ISO_ASAP) != 0
-				|| isochronousData->starting_frame_number == NULL) {
-			// All reads from the microframe index register must be
-			// incremented by 1. (XHCI 1.2 § 4.14.2.1.4 p265.)
-			frame = (ReadRunReg32(XHCI_MFINDEX) + 1) >> 3;
-			td->trbs[0].flags |= TRB_3_ISO_SIA_BIT;
-		} else {
-			frame = *isochronousData->starting_frame_number;
-			td->trbs[0].flags |= TRB_3_FRID(frame);
-		}
-		if (isochronousData->starting_frame_number != NULL)
-			*isochronousData->starting_frame_number = frame;
+		// Record the scheduling request; the Frame IDs are assigned by
+		// _LinkDescriptorForPipe(), which holds the endpoint lock and so can
+		// keep them in step with the order the TDs reach the ring. If ISO_ASAP
+		// is set we are queueing this "right away", and so want to reset the
+		// starting_frame_number; otherwise we use the passed one.
+		td->iso_packets = isochronousData->packet_count;
+		td->iso_asap = (isochronousData->flags & USB_ISO_ASAP) != 0
+			|| isochronousData->starting_frame_number == NULL;
+		td->iso_requested_frame = td->iso_asap
+			? 0 : *isochronousData->starting_frame_number;
 	}
 
 	// Set the ENT (Evaluate Next TRB) bit, so that the HC will not switch
@@ -1131,6 +1147,12 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 	if (status != B_OK) {
 		FreeDescriptor(td);
 		return status;
+	}
+
+	// _LinkDescriptorForPipe() assigned the Frame IDs; report where it landed.
+	if (isochronousData != NULL
+			&& isochronousData->starting_frame_number != NULL) {
+		*isochronousData->starting_frame_number = td->iso_scheduled_frame;
 	}
 
 	return B_OK;
@@ -1247,20 +1269,15 @@ XHCI::_SubmitIsochronousVariableOut(Transfer *transfer, xhci_endpoint *endpoint)
 		}
 	}
 
-	// Determine the (starting) frame: with ISO_ASAP we start the first TD as
-	// soon as possible and the rest are consumed one per interval, matching the
+	// Record the scheduling request; _LinkDescriptorForPipe() assigns the Frame
+	// IDs under the endpoint lock. With ISO_ASAP we start the first TD as soon
+	// as possible and the rest are consumed one per interval, matching the
 	// general path (XHCI 1.2 § 4.14.2.1.4).
-	uint32 frame;
-	if ((isochronousData->flags & USB_ISO_ASAP) != 0
-			|| isochronousData->starting_frame_number == NULL) {
-		frame = (ReadRunReg32(XHCI_MFINDEX) + 1) >> 3;
-		td->trbs[0].flags |= TRB_3_ISO_SIA_BIT;
-	} else {
-		frame = *isochronousData->starting_frame_number;
-		td->trbs[0].flags |= TRB_3_FRID(frame);
-	}
-	if (isochronousData->starting_frame_number != NULL)
-		*isochronousData->starting_frame_number = frame;
+	td->iso_packets = packetCount;
+	td->iso_asap = (isochronousData->flags & USB_ISO_ASAP) != 0
+		|| isochronousData->starting_frame_number == NULL;
+	td->iso_requested_frame = td->iso_asap
+		? 0 : *isochronousData->starting_frame_number;
 
 	td->trb_used = packetCount;
 	td->transfer = transfer;
@@ -1271,7 +1288,135 @@ XHCI::_SubmitIsochronousVariableOut(Transfer *transfer, xhci_endpoint *endpoint)
 		return status;
 	}
 
+	if (isochronousData->starting_frame_number != NULL)
+		*isochronousData->starting_frame_number = td->iso_scheduled_frame;
+
 	return B_OK;
+}
+
+
+uint32
+XHCI::_ScheduleIsochronousTDs(xhci_endpoint* endpoint, xhci_td* td,
+	uint32 packetCount, bool asap, uint32 requestedFrame)
+{
+	// An isochronous transfer posts one Isoch TD per packet, so every TRB here
+	// is scheduled independently by the controller and each one needs its start
+	// time expressed the way this controller expects.
+	//
+	// Without Contiguous Frame ID Capability (CFC = 0) only the first TD of a
+	// data flow may carry a Frame ID; the controller ignores the field in the
+	// rest, and software shall set Start Isoch ASAP in them.
+	//
+	// With CFC = 1 -- mandatory for every xHCI 1.1 and 1.2 controller -- the
+	// controller matches the Frame ID of every TD that does not set SIA against
+	// the Frame Index of MFINDEX, and that match is what resynchronizes the
+	// pipe after a Missed Service Error. If the Frame IDs are absent it cannot
+	// place the TDs, so it skips them, reports a Missed Service Error for each
+	// one until the ring is exhausted, and the stream never recovers.
+	// (XHCI 1.2 § 4.11.2.5, § 4.11.2.5.1, § 4.11.2.5.2.)
+	//
+	// Returns the frame the transfer was scheduled to start on.
+
+	// The packet count reaches us from the transfer, and every TD it describes
+	// is written below; never index past what was allocated for this
+	// descriptor.
+	if (packetCount > td->trb_count) {
+		TRACE_ERROR("isochronous packet count %" B_PRIu32 " exceeds the %"
+			B_PRIu32 " TRBs allocated\n", packetCount, td->trb_count);
+		packetCount = td->trb_count;
+	}
+
+	// Every read of MFINDEX must be incremented by one microframe to allow for
+	// the read latency and the position within the microframe.
+	// (XHCI 1.2 § 4.14.2.1.4.)
+	const uint32 currentFrame = ((ReadRunReg32(XHCI_MFINDEX) + 1) >> 3)
+		& XHCI_FRAME_ID_MASK;
+
+	// ESIT = 2^interval microframes (XHCI 1.2 § 6.2.3.6). Shorter than a frame,
+	// consecutive TDs share a Frame ID -- 8 >> interval of them per frame, as
+	// the first TD of a frame must begin at that frame's first ESIT. A frame or
+	// longer, one TD per ESIT and the Frame ID must fall on an ESIT boundary.
+	// (XHCI 1.2 § 4.11.2.5.1.)
+	uint32 tdsPerFrame = 1, framesPerTD = 1;
+	if (endpoint->interval < 3)
+		tdsPerFrame = 8 >> endpoint->interval;
+	else
+		framesPerTD = 1U << (endpoint->interval - 3);
+
+	// How far ahead this transfer would reach. Software shall not schedule a TD
+	// beyond the End Frame ID, 895 ms ahead of MFINDEX (XHCI 1.2 § 4.11.2.5).
+	// An endpoint may declare an ESIT long enough that even a few TDs run past
+	// it, and the packet count comes from the caller, so check rather than
+	// assume; fall back to the ASAP form, which is always legal, if it does.
+	const uint32 spannedFrames = (framesPerTD > 1)
+		? (packetCount * framesPerTD)
+		: ((packetCount + tdsPerFrame - 1) / tdsPerFrame);
+
+	if (!fUseFrameID || spannedFrames > XHCI_MAX_SCHEDULED_FRAMES) {
+		// Frame IDs are either ignored by this controller past the first TD, or
+		// cannot describe this transfer. Start as soon as possible.
+		if (asap || spannedFrames > XHCI_MAX_SCHEDULED_FRAMES) {
+			td->trbs[0].flags |= TRB_3_ISO_SIA_BIT;
+			requestedFrame = currentFrame;
+		} else {
+			td->trbs[0].flags |= TRB_3_FRID(requestedFrame);
+		}
+		for (uint32 i = 1; i < packetCount; i++)
+			td->trbs[i].flags |= TRB_3_ISO_SIA_BIT;
+
+		// The schedule is no longer continuous; re-anchor on the next transfer.
+		endpoint->frame_valid = false;
+		return requestedFrame;
+	}
+
+	// Start Frame ID = (current Frame Index + IST + 1) MOD 2048: the earliest
+	// frame the controller can still be given work for. (XHCI 1.2 § 4.11.2.5.)
+	const uint32 startFrame = (currentFrame + fISTFrames + 1)
+		& XHCI_FRAME_ID_MASK;
+
+	uint32 frame = endpoint->next_frame;
+	uint32 used = endpoint->frame_used;
+
+	// Continue this endpoint's existing schedule only while it is still in the
+	// future; otherwise the controller has already passed it. Frame IDs are
+	// modulo 2048, so compare by the forward distance.
+	const bool aheadOfController = endpoint->frame_valid
+		&& ((frame - startFrame) & XHCI_FRAME_ID_MASK) < (XHCI_FRAME_ID_MASK / 2);
+
+	if (!asap) {
+		frame = requestedFrame & XHCI_FRAME_ID_MASK;
+		used = 0;
+	} else if (!aheadOfController) {
+		// A fresh stream, or one that fell behind: anchor at the first frame
+		// the controller can still execute. A TD that begins a frame's run of
+		// shared Frame IDs must be the first of that run.
+		frame = startFrame;
+		used = 0;
+	}
+
+	// An ESIT of a frame or more must start on an ESIT boundary.
+	if (framesPerTD > 1)
+		frame = (frame + framesPerTD - 1) & ~(framesPerTD - 1) & XHCI_FRAME_ID_MASK;
+
+	const uint32 firstFrame = frame;
+	for (uint32 i = 0; i < packetCount; i++) {
+		td->trbs[i].flags &= ~TRB_3_ISO_SIA_BIT;
+		td->trbs[i].flags |= TRB_3_FRID(frame);
+
+		if (framesPerTD > 1) {
+			frame = (frame + framesPerTD) & XHCI_FRAME_ID_MASK;
+		} else if (++used == tdsPerFrame) {
+			// This frame's run of shared Frame IDs is complete.
+			frame = (frame + 1) & XHCI_FRAME_ID_MASK;
+			used = 0;
+		}
+	}
+
+	endpoint->next_frame = (uint16)frame;
+	endpoint->frame_used = (uint8)used;
+	endpoint->frame_valid = true;
+
+	return firstFrame;
 }
 
 
@@ -1518,6 +1663,12 @@ XHCI::CreateDescriptor(uint32 trbCount, uint32 bufferCount, size_t bufferSize)
 		TRACE_ERROR("failed to allocate a transfer descriptor\n");
 		return NULL;
 	}
+
+	// calloc() zeroes the descriptor, but the KDL path above does not.
+	result->iso_packets = 0;
+	result->iso_requested_frame = 0;
+	result->iso_scheduled_frame = 0;
+	result->iso_asap = false;
 
 	// We always allocate 1 more TRB than requested, so that
 	// _LinkDescriptorForPipe() has room to insert a link TRB.
@@ -2102,6 +2253,10 @@ XHCI::_InsertEndpointForPipe(Pipe *pipe)
 		endpoint->td_head = NULL;
 		endpoint->used = 0;
 		endpoint->next = 0;
+		endpoint->interval = 0;
+		endpoint->frame_valid = false;
+		endpoint->frame_used = 0;
+		endpoint->next_frame = 0;
 		endpoint->last_error_log = 0;
 		endpoint->error_count = 0;
 
@@ -2217,6 +2372,15 @@ XHCI::_LinkDescriptorForPipe(xhci_td *descriptor, xhci_endpoint *endpoint)
 			&& endpoint->td_head->transfer->IsFragmented()) {
 		TRACE_ERROR("cannot submit transfer: a fragmented transfer is queued\n");
 		return B_DEV_RESOURCE_CONFLICT;
+	}
+
+	// Assign the isochronous Frame IDs here, rather than where the TRBs were
+	// built: this is where the order the TDs reach the ring is fixed, and the
+	// Frame IDs of consecutive TDs have to follow that same order.
+	if (descriptor->iso_packets != 0) {
+		descriptor->iso_scheduled_frame = _ScheduleIsochronousTDs(endpoint,
+			descriptor, descriptor->iso_packets, descriptor->iso_asap,
+			descriptor->iso_requested_frame);
 	}
 
 	endpoint->used++;
@@ -2406,6 +2570,13 @@ XHCI::ConfigureEndpoint(xhci_endpoint* ep, uint8 slot, uint8 number, uint8 type,
 		}
 	}
 	dwendpoint0 |= ENDPOINT_0_INTERVAL(calcInterval);
+
+	// Kept for isochronous Frame ID scheduling, which needs the ESIT length.
+	// (See _ScheduleIsochronousTDs().)
+	ep->interval = (uint8)calcInterval;
+	ep->frame_valid = false;
+	ep->frame_used = 0;
+	ep->next_frame = 0;
 
 	// For non-isochronous endpoints, we want the controller to retry failed
 	// transfers, if possible. (XHCI 1.2 § 4.10.2.3 p197.)

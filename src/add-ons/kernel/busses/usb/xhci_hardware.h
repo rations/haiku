@@ -308,6 +308,14 @@
 #define TRB_3_ENDPOINT_GET(x)	(((x) >> 16) & 0x1f)
 #define TRB_3_FRID(x)			(((x) & 0x7ff) << 20)
 #define TRB_3_FRID_GET(x)		(((x) >> 20) & 0x7ff)
+
+// A Frame ID is the frame portion of MFINDEX, and so is modulo 2048.
+// (XHCI 1.2 § 4.11.2.5.)
+#define XHCI_FRAME_ID_MASK			0x7ff
+// Software shall not schedule an Isoch TD with a Frame ID beyond the End Frame
+// ID, 895 ms ahead of the current MFINDEX. (XHCI 1.2 § 4.11.2.5.)
+#define XHCI_MAX_SCHEDULED_FRAMES	895
+
 #define TRB_3_SLOT(x)			(((x) & 0xff) << 24)
 #define TRB_3_SLOT_GET(x)		(((x) >> 24) & 0xff)
 

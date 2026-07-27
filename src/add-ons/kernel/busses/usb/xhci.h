@@ -46,6 +46,15 @@ typedef struct xhci_td {
 	int32		td_transferred;
 	int32		trb_left;
 
+	// Isochronous scheduling request. Filled in by the submit path and applied
+	// by _LinkDescriptorForPipe() under the endpoint lock, so the Frame IDs a
+	// transfer is given match the order its TDs actually reach the ring.
+	// iso_packets is 0 for a non-isochronous transfer.
+	uint32		iso_packets;
+	uint32		iso_requested_frame;
+	uint32		iso_scheduled_frame;
+	bool		iso_asap;
+
 	xhci_td*	next;
 } xhci_td;
 
@@ -65,6 +74,19 @@ typedef struct xhci_endpoint {
 
 	xhci_trb*		trbs; // [XHCI_ENDPOINT_RING_SIZE]
 	phys_addr_t 	trb_addr;
+
+	// Isochronous Frame ID scheduling, used only when the controller has
+	// Contiguous Frame ID Capability. "interval" is the endpoint context
+	// Interval field, i.e. an ESIT of 2^interval microframes (XHCI 1.2
+	// § 6.2.3.6). "next_frame" is the Frame ID the next Isoch TD of this
+	// endpoint should carry, and "frame_used" how many TDs of the frame it
+	// names have already been scheduled (for ESITs shorter than a frame, where
+	// consecutive TDs share a Frame ID). Written only by
+	// _ScheduleIsochronousTDs(), under "lock".
+	uint8			interval;
+	bool			frame_valid;
+	uint8			frame_used;
+	uint16			next_frame;
 
 	// Rate limiting for transfer error reports; see HandleTransferComplete().
 	// Accessed only there, under "lock".
@@ -173,6 +195,10 @@ private:
 
 			status_t			_SubmitIsochronousVariableOut(
 									Transfer *transfer, xhci_endpoint *endpoint);
+			uint32				_ScheduleIsochronousTDs(
+									xhci_endpoint *endpoint, xhci_td *td,
+									uint32 packetCount, bool asap,
+									uint32 requestedFrame);
 
 			status_t			_LinkDescriptorForPipe(xhci_td *descriptor,
 									xhci_endpoint *endpoint);
@@ -278,6 +304,12 @@ private:
 			// Devices
 			struct xhci_device	fDevices[XHCI_MAX_DEVICES];
 			int32				fContextSizeShift; // 0/1 for 32/64 bytes
+
+			// Contiguous Frame ID Capability (HCCPARAMS1 CFC), and the
+			// Isochronous Scheduling Threshold rounded up to whole frames.
+			// Both are fixed at init; see _ScheduleIsochronousTDs().
+			bool				fUseFrameID;
+			uint32				fISTFrames;
 
 			// Transfers
 			mutex				fFinishedLock;
